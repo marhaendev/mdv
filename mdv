@@ -1,0 +1,267 @@
+#!/usr/bin/env bash
+# mdv - Minimal DevOps CLI
+# Version: 1.0.0
+
+set -euo pipefail
+
+VERSION="1.0.0"
+CONFIG_TAG="# mdv"
+HOSTS_FILE="/etc/hosts"
+NGINX_CONF_DIR="/etc/nginx/conf.d"
+FIREWALL_CMD="$(command -v firewall-cmd || true)"
+CERTBOT_CMD="$(command -v certbot || true)"
+JQ_CMD="$(command -v jq || true)"
+
+die(){ echo "Error: $*" >&2; exit 1; }
+exists(){ command -v "$1" >/dev/null 2>&1; }
+
+# --- Firewall (Port) ---
+fw_ports_all() {
+  local runtime permanent
+  runtime="$($FIREWALL_CMD --quiet --list-ports || true)"
+  permanent="$($FIREWALL_CMD --quiet --permanent --list-ports || true)"
+  printf "%s %s\n" "$runtime" "$permanent" | tr ' ' '\n' | sort -u | sed '/^$/d'
+}
+
+listening_ports() {
+  ss -tuln | awk 'NR>1 {proto=$1; split($5,a,":"); port=a[length(a)];
+    if (port ~ /^[0-9]+$/) printf "%s/%s\n", port, proto}' | sort -u
+}
+
+port_list() {
+  local mode="${1:-all}"
+  mapfile -t allowed < <(fw_ports_all)
+  mapfile -t listening < <(listening_ports)
+  declare -A allowed_set; for p in "${allowed[@]}"; do allowed_set["$p"]=1; done
+
+  [[ "$mode" == "on" || "$mode" == "all" ]] && {
+    echo "=== Allowed ports ==="
+    ((${#allowed[@]})) && printf '%s\n' "${allowed[@]}" || echo "(none)"
+    echo
+  }
+  [[ "$mode" == "off" || "$mode" == "all" ]] && {
+    echo "=== Listening but not allowed ==="
+    off=()
+    for p in "${listening[@]}"; do [[ -z "${allowed_set[$p]:-}" ]] && off+=("$p"); done
+    ((${#off[@]})) && printf '%s\n' "${off[@]}" || echo "(none)"
+  }
+}
+
+port_enable() {
+  local port="$1" proto="${2:-tcp}"
+  $FIREWALL_CMD --add-port="$port/$proto"
+  $FIREWALL_CMD --permanent --add-port="$port/$proto"
+  $FIREWALL_CMD --reload
+  echo "✅ Enabled $port/$proto"
+}
+
+port_disable() {
+  local port="$1" proto="${2:-tcp}"
+  $FIREWALL_CMD --remove-port="$port/$proto" || true
+  $FIREWALL_CMD --permanent --remove-port="$port/$proto" || true
+  $FIREWALL_CMD --reload
+  echo "🛑 Disabled $port/$proto"
+}
+
+# --- Domain (/etc/hosts) ---
+domain_add() {
+  local domain="$1" ip="$2"
+  sed -i -E "/[[:space:]]$domain([[:space:]]|\$)/d" "$HOSTS_FILE"
+  echo "$ip $domain $CONFIG_TAG" >> "$HOSTS_FILE"
+  echo "✅ Added $domain -> $ip"
+}
+
+domain_rm() {
+  local domain="$1"
+  sed -i -E "/[[:space:]]$domain([[:space:]]|\$)/d" "$HOSTS_FILE"
+  echo "🗑 Removed $domain"
+}
+
+domain_list() {
+  echo "=== mdv domains ==="
+  grep "$CONFIG_TAG" "$HOSTS_FILE" || echo "(none)"
+}
+
+domain_check() {
+  local domain="$1"
+  local resolved; resolved="$(getent hosts "$domain" | awk '{print $1}')"
+  echo "$domain resolves to: $resolved"
+  echo "Server IP: $(hostname -I | awk '{print $1}')"
+}
+
+# --- App (Nginx proxy) ---
+app_add() {
+  local domain="$1" port="$2"
+  local conf="$NGINX_CONF_DIR/$domain.conf"
+  cat > "$conf" <<EOF
+server {
+    listen 80;
+    server_name $domain;
+
+    location / {
+        proxy_pass http://127.0.0.1:$port;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host \$host;
+        proxy_cache_bypass \$http_upgrade;
+    }
+}
+EOF
+  nginx -t && systemctl reload nginx
+  echo "✅ App $domain → 127.0.0.1:$port"
+}
+
+app_rm() {
+  local domain="$1"
+  rm -f "$NGINX_CONF_DIR/$domain.conf"
+  nginx -t && systemctl reload nginx
+  echo "🗑 Removed app $domain"
+}
+
+app_list() {
+  ls $NGINX_CONF_DIR/*.conf 2>/dev/null || echo "(none)"
+}
+
+app_ssl() {
+  local domain="$1"
+  [[ -z "$CERTBOT_CMD" ]] && die "certbot not installed. Run: dnf install -y certbot python3-certbot-nginx"
+  $CERTBOT_CMD --nginx -d "$domain"
+}
+
+# --- Config (Export/Import JSON) ---
+config_export() {
+  local file="$1"
+  [[ -z "$JQ_CMD" ]] && die "jq not installed. Run: dnf install -y jq"
+
+  echo "{" >"$file"
+
+  # Ports
+  echo '  "ports": [' >>"$file"
+  fw_ports_all | sed 's/^/    "/;s/$/",/' >>"$file"
+  sed -i '$ s/,$//' "$file"
+  echo '  ],' >>"$file"
+
+  # Domains
+  echo '  "domains": {' >>"$file"
+  grep "$CONFIG_TAG" "$HOSTS_FILE" | awk '{print $1, $2}' | \
+    sed 's/ /": "/;s/^/    "/;s/$/",/' >>"$file"
+  sed -i '$ s/,$//' "$file"
+  echo '  },' >>"$file"
+
+  # Apps
+  echo '  "apps": [' >>"$file"
+  for f in $NGINX_CONF_DIR/*.conf 2>/dev/null; do
+    d=$(basename "$f" .conf)
+    p=$(grep -oP '127\.0\.0\.1:\K[0-9]+' "$f" | head -1)
+    [[ -n "$p" ]] && echo "    {\"domain\": \"$d\", \"port\": $p, \"ssl\": false}," >>"$file"
+  done
+  sed -i '$ s/,$//' "$file"
+  echo '  ]' >>"$file"
+
+  echo "}" >>"$file"
+  echo "✅ Exported config to $file"
+}
+
+config_import() {
+  local file="$1"
+  [[ ! -f "$file" ]] && die "File not found: $file"
+  [[ -z "$JQ_CMD" ]] && die "jq not installed. Run: dnf install -y jq"
+
+  # Ports
+  $JQ_CMD -r '.ports[]' "$file" | while read -r pp; do
+    port="${pp%/*}"; proto="${pp#*/}"
+    port_enable "$port" "$proto"
+  done
+
+  # Domains
+  $JQ_CMD -r '.domains | to_entries[] | "\(.key) \(.value)"' "$file" | while read -r domain ip; do
+    domain_add "$domain" "$ip"
+  done
+
+  # Apps
+  $JQ_CMD -c '.apps[]' "$file" | while read -r app; do
+    domain=$(echo "$app" | $JQ_CMD -r .domain)
+    port=$(echo "$app" | $JQ_CMD -r .port)
+    ssl=$(echo "$app" | $JQ_CMD -r .ssl)
+    app_add "$domain" "$port"
+    [[ "$ssl" == "true" ]] && app_ssl "$domain"
+  done
+}
+
+# --- Utility ---
+doctor() {
+  echo "=== mdv doctor ==="
+  for s in firewalld nginx; do
+    systemctl is-active --quiet $s && echo "$s: running" || echo "$s: not running"
+  done
+  exists pm2 && echo "pm2: installed" || echo "pm2: not installed"
+  exists certbot && echo "certbot: installed" || echo "certbot: not installed"
+  exists jq && echo "jq: installed" || echo "jq: not installed"
+}
+
+usage() {
+  cat <<EOF
+mdv v$VERSION - Minimal DevOps CLI
+
+Usage:
+  mdv port list [on|off]
+  mdv port e <port> [proto]      # enable port
+  mdv port d <port> [proto]      # disable port
+
+  mdv domain add <domain> <ip>
+  mdv domain rm <domain>
+  mdv domain list
+  mdv domain check <domain>
+
+  mdv app add <domain> <port>
+  mdv app rm <domain>
+  mdv app list
+  mdv app ssl <domain>
+
+  mdv config export <file.json>
+  mdv config import <file.json>
+
+  mdv doctor
+  mdv version
+  mdv help
+EOF
+}
+
+# --- Main ---
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  port) sub="${1:-}"; shift || true
+    case "$sub" in
+      list) port_list "${1:-all}";;
+      e) port_enable "$@";;
+      d) port_disable "$@";;
+      *) usage;;
+    esac;;
+  domain) sub="${1:-}"; shift || true
+    case "$sub" in
+      add) domain_add "$@";;
+      rm) domain_rm "$@";;
+      list) domain_list;;
+      check) domain_check "$@";;
+      *) usage;;
+    esac;;
+  app) sub="${1:-}"; shift || true
+    case "$sub" in
+      add) app_add "$@";;
+      rm) app_rm "$@";;
+      list) app_list;;
+      ssl) app_ssl "$@";;
+      *) usage;;
+    esac;;
+  config) sub="${1:-}"; shift || true
+    case "$sub" in
+      export) config_export "$@";;
+      import) config_import "$@";;
+      *) usage;;
+    esac;;
+  doctor) doctor;;
+  version) echo "mdv v$VERSION";;
+  help|"") usage;;
+  *) usage;;
+esac
