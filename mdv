@@ -1,6 +1,6 @@
 #!/bin/bash
 # mdv - VPS Management Tool (14 Fitur Utama)
-# Versi: 1.14.3 (Fixed package names, repos, services, doctor checks)
+# Versi: 1.14.4 (Fixed Remi URL, CRB enable, PHP module install/enable, package names for AlmaLinux 9)
 # Kompatibel: AlmaLinux/RHEL/Fedora (dnf/yum, firewalld), Debian/Ubuntu (apt, ufw fallback)
 # Deteksi Distribusi
 detect_os() {
@@ -38,9 +38,10 @@ setup_php_repos() {
     case $OS in
         "almalinux"|"rhel"|"centos"|"fedora")
             pkg_install epel-release
-            dnf install -y "https://rpms.remirepo.net/enterprise/remi-release-${VER}.rpm" || true
+            dnf install -y https://rpms.remirepo.net/enterprise/remi-release-9.rpm || true
+            dnf config-manager --set-enabled crb || /usr/bin/crb enable || true
             dnf module reset php -y || true
-            dnf module enable php:remi-8.3 -y || true
+            dnf module enable php:remi-8.3 -y || dnf module install php:remi-8.3 -y || true
             ;;
     esac
 }
@@ -199,14 +200,7 @@ handle_init() {
     check_root
     echo "Memulai inisialisasi mdv: Menginstal dependensi untuk 14 fitur..."
     detect_os
-    case $OS in
-        "almalinux"|"rhel"|"centos"|"fedora")
-            dnf install -y epel-release
-            dnf install -y "https://rpms.remirepo.net/enterprise/remi-release-${VER}.rpm" || true
-            dnf module reset php -y || true
-            dnf module enable php:remi-8.3 -y || true
-            ;;
-    esac
+    setup_php_repos
     # Paket dasar
     CORE_PKGS="jq htop curl wget git"
     pkg_install $CORE_PKGS
@@ -267,7 +261,7 @@ EOF
     pkg_install fail2ban
     systemctl enable --now fail2ban
     # PHP & phpMyAdmin
-    pkg_install php php-fpm php-mysql php-mysqli phpMyAdmin composer
+    pkg_install php php-fpm php-mysqlnd php-mysqli php-fedora-autoloader phpMyAdmin composer
     systemctl enable --now php-fpm
     # Buat direktori www jika belum ada
     mkdir -p /var/www
@@ -310,7 +304,7 @@ handle_utility() {
             echo "=== End Status ==="
             ;;
         "version")
-            echo "mdv v1.14.3 (14 Fitur)"
+            echo "mdv v1.14.4 (14 Fitur)"
             ;;
         "help")
             show_help
@@ -466,16 +460,16 @@ handle_pma() {
     case $SUB in
         "add")
             setup_php_repos
-            pkg_install phpMyAdmin php-mysqli
+            pkg_install php-fpm php-mysqlnd php-mysqli php-fedora-autoloader phpMyAdmin
             mkdir -p /var/www/html
-            ln -s /usr/share/phpMyAdmin /var/www/html/pma
+            ln -sf /usr/share/phpMyAdmin /var/www/html/pma
             systemctl restart php-fpm nginx || true
             echo "phpMyAdmin diinstal dan setup untuk $3."
             ;;
         "rm")
             case $OS in
                 "ubuntu"|"debian") apt purge phpmyadmin 2>/dev/null ;;
-                *) dnf remove -y phpMyAdmin 2>/dev/null || yum remove -y phpMyAdmin 2>/dev/null ;;
+                *) dnf remove -y phpMyAdmin php-fedora-autoloader 2>/dev/null || yum remove -y phpMyAdmin php-fedora-autoloader 2>/dev/null ;;
             esac
             rm -rf /var/www/html/pma
             echo "phpMyAdmin dihapus untuk $3."
@@ -485,10 +479,10 @@ handle_pma() {
             ;;
         "init"|"i")
             setup_php_repos
-            pkg_install php php-fpm php-mysql php-mysqli phpMyAdmin
+            pkg_install php php-fpm php-mysqlnd php-mysqli php-fedora-autoloader phpMyAdmin
             systemctl enable --now php-fpm
             mkdir -p /var/www/html
-            ln -s /usr/share/phpMyAdmin /var/www/html/pma
+            ln -sf /usr/share/phpMyAdmin /var/www/html/pma
             fw_cmd "add-port" "80" "tcp"
             systemctl restart php-fpm nginx || true
             echo "phpMyAdmin diinisialisasi. Akses di http://$(curl -s ifconfig.me)/pma"
