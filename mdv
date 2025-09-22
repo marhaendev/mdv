@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # mdv - VPS Management Tool (14 Fitur Utama)
-# Versi: 1.0
+# Versi: 1.14
 # Kompatibel: AlmaLinux/RHEL/Fedora (dnf/yum, firewalld), Debian/Ubuntu (apt, ufw fallback)
 
 # Deteksi Distribusi
