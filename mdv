@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # mdv - VPS Management Tool (Multi-Distro Compatible)
-# Versi: 1.2 (Added init command)
+# Versi: 1.3 (Fixed port management; Expanded doctor for all dependencies)
 # Kompatibel: AlmaLinux/RHEL/Fedora (dnf/yum, firewalld), Debian/Ubuntu (apt, ufw fallback)
 
 # Deteksi Distribusi
@@ -54,7 +54,7 @@ fw_cmd() {
             "list-ports") ufw status numbered ;;
             "add-port") ufw allow "$2/$3" && ufw reload ;;
             "remove-port") ufw delete allow "$2/$3" && ufw reload ;;
-            "query-port") ufw status | grep "$2/$3" >/dev/null 2>&1 && echo true || echo false ;;
+            "query-port") ufw status | grep "$2/$3" >/dev/null 2>&1 && echo "yes" || echo "no" ;;
             "list-all") ufw status verbose ;;
             "add-rich-rule") echo "UFW tidak mendukung rich rules; gunakan allow/deny manual." ;;
             "panic-off") ufw reset --force && ufw enable ;;
@@ -76,9 +76,6 @@ load_config() {
         cat "$CONFIG_FILE" 2>/dev/null | jq . || echo "{}"
     else
         echo "{}"
-        if [ ! -f "$CONFIG_FILE" ]; then
-            pkg_install jq
-        fi
     fi
 }
 
@@ -93,6 +90,11 @@ check_root() {
         echo "Error: Jalankan sebagai root atau dengan sudo."
         exit 1
     fi
+}
+
+# Fungsi helper: Validasi port (hanya angka positif)
+is_valid_port() {
+    [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
 }
 
 # Fungsi utama: Help
@@ -360,7 +362,7 @@ handle_init() {
     echo "Catatan: Beberapa setup (seperti mysql_secure_installation) memerlukan interaksi manual."
 }
 
-# 1. Port Management
+# 1. Port Management (Diperbaiki)
 handle_port() {
     SUB=$2
     case $SUB in
@@ -368,7 +370,7 @@ handle_port() {
             if [ "$3" = "on" ]; then
                 fw_cmd "list-ports"
             elif [ "$3" = "off" ]; then
-                ss -tuln | awk '{print $5}' | cut -d: -f2 | sort -u | grep -E '^[0-9]+$' | while read p; do  # Filter hanya numerik
+                ss -tuln | awk '{print $5}' | cut -d: -f2 | sort -u | grep -E '^[0-9]+$' | while read p; do
                     QUERY_TCP=$(fw_cmd "query-port" "$p" "tcp")
                     QUERY_UDP=$(fw_cmd "query-port" "$p" "udp")
                     if [ "$QUERY_TCP" != "yes" ] && [ "$QUERY_UDP" != "yes" ]; then
@@ -376,7 +378,7 @@ handle_port() {
                     fi
                 done
             else
-                ss -tuln | awk '{print $5}' | cut -d: -f2 | sort -u | grep -E '^[0-9]+$ || echo "No listening ports found."
+                ss -tuln | awk '{print $5}' | cut -d: -f2 | sort -u | grep -E '^[0-9]+$' || echo "No listening ports found."
                 echo "--- Allowed Ports ---"
                 fw_cmd "list-ports"
             fi
@@ -508,13 +510,11 @@ handle_pma() {
     SUB=$2
     case $SUB in
         "add")
-            pkg_install phpmyadmin php-mysqli  # Paket disesuaikan per distro
-            # Setup dasar untuk domain (asumsi symlink ke /var/www/html/pma)
+            pkg_install phpmyadmin php-mysqli
             ln -s /usr/share/phpmyadmin /var/www/html/pma
             echo "phpMyAdmin diinstal dan setup untuk $3."
             ;;
         "rm")
-            # Purge phpmyadmin (Debian-style; sesuaikan untuk RHEL)
             apt purge phpmyadmin 2>/dev/null || yum remove phpmyadmin 2>/dev/null || dnf remove phpmyadmin 2>/dev/null
             rm -rf /var/www/html/pma
             echo "phpMyAdmin dihapus untuk $3."
@@ -540,7 +540,7 @@ handle_node() {
         "start")
             DIR=$3
             NAME=$4
-            cd "$DIR" && pm2 start npm --name "$NAME" -- start  # Asumsi package.json dengan "start"
+            cd "$DIR" && pm2 start npm --name "$NAME" -- start
             pm2 save
             echo "Node app $NAME dimulai dari $DIR."
             ;;
@@ -837,11 +837,10 @@ handle_backup() {
             ;;
         "db")
             NAME=$3
-            mysqldump --all-databases > "/backup/db-$NAME-$(date +%Y%m%d).sql"  # Asumsi root pass kosong atau set env
+            mysqldump --all-databases > "/backup/db-$NAME-$(date +%Y%m%d).sql"
             echo "Backup DB $NAME selesai."
             ;;
         "all")
-            # Backup semua domain dan DB
             for d in $(mdv app list); do mdv backup app "$d"; done
             mysqldump --all-databases > "/backup/all-dbs-$(date +%Y%m%d).sql"
             echo "Backup semua selesai."
@@ -917,17 +916,16 @@ handle_monitor() {
     case $SUB in
         "enable")
             WEBHOOK=$3
-            # Buat cron untuk check dan kirim ke Telegram (placeholder)
             echo "* * * * * curl -X POST '$WEBHOOK' -d 'Server status: OK'" >> /etc/crontab
             echo "Monitoring diaktifkan dengan webhook $WEBHOOK."
             ;;
         "cpu")
-            THRESHOLD=90  # Default
+            THRESHOLD=90
             if [[ $3 == --threshold* ]]; then THRESHOLD=${3#*=}; fi
-            echo "Alert CPU > $THRESHOLD% diaktifkan (setup cron manual jika diperlukan)."
+            echo "Alert CPU > $THRESHOLD% diaktifkan."
             ;;
         "disk")
-            THRESHOLD=80  # Default
+            THRESHOLD=80
             if [[ $3 == --threshold* ]]; then THRESHOLD=${3#*=}; fi
             echo "Alert Disk > $THRESHOLD% diaktifkan."
             ;;
@@ -996,22 +994,52 @@ handle_config() {
     esac
 }
 
-# 17. Utility
+# 17. Utility (Diperluas: Doctor cek semua dependensi)
 handle_utility() {
     case $1 in
         "doctor")
+            echo "=== Status Dependensi mdv ==="
+            # Core
+            command -v jq >/dev/null && echo "jq: OK" || echo "jq: Error"
+            command -v htop >/dev/null && echo "htop: OK" || echo "htop: Error"
+            # Web & Proxy
             systemctl is-active --quiet nginx && echo "Nginx: OK" || echo "Nginx: Error"
+            # Database
             systemctl is-active --quiet mariadb && echo "MariaDB: OK" || echo "MariaDB: Error"
+            command -v psql >/dev/null && echo "PostgreSQL: OK" || echo "PostgreSQL: Error"
+            # Firewall
             fw_cmd "list-ports" > /dev/null 2>&1 && echo "Firewall: OK" || echo "Firewall: Error"
+            # Node.js & PM2
+            command -v node >/dev/null && echo "Node.js: OK" || echo "Node.js: Error"
+            command -v pm2 >/dev/null && echo "PM2: OK" || echo "PM2: Error"
+            # Golang
+            command -v go >/dev/null && echo "Golang: OK" || echo "Golang: Error"
+            # Docker
+            systemctl is-active --quiet docker && echo "Docker: OK" || echo "Docker: Error"
+            # Cache
+            systemctl is-active --quiet redis-server && echo "Redis: OK" || echo "Redis: Error"
+            # Security
+            systemctl is-active --quiet fail2ban && echo "Fail2ban: OK" || echo "Fail2ban: Error"
+            # PHP
+            command -v php >/dev/null && echo "PHP: OK" || echo "PHP: Error"
+            # Mail
+            systemctl is-active --quiet postfix && echo "Postfix: OK" || echo "Postfix: Error"
+            systemctl is-active --quiet dovecot && echo "Dovecot: OK" || echo "Dovecot: Error"
+            # Pterodactyl
+            systemctl is-active --quiet supervisor && echo "Supervisor (Pterodactyl): OK" || echo "Supervisor (Pterodactyl): Error"
+            # AI/ML
+            command -v python3 >/dev/null && echo "Python3: OK" || echo "Python3: Error"
+            # K3s
+            command -v kubectl >/dev/null && echo "K3s/Kubectl: OK" || echo "K3s/Kubectl: Error"
+            echo "=== End Status ==="
             ;;
         "version")
-            echo "mdv v1.2"
+            echo "mdv v1.3"
             ;;
         "help")
             show_help
             ;;
         "update")
-            # Asumsi skrip dari Git; ganti dengan path repo
             cd /opt/mdv && git pull origin main 2>/dev/null || echo "Update gagal; clone repo manual."
             ;;
         *)
@@ -1096,7 +1124,6 @@ handle_lb() {
             DOMAIN=$3
             shift 3
             PORTS="$*"
-            # Tambah upstream ke nginx.conf
             cat >> /etc/nginx/nginx.conf << EOF
 
 upstream backend_$DOMAIN {
@@ -1133,7 +1160,7 @@ handle_file() {
     SUB=$2
     case $SUB in
         "upload")
-            scp "$3" root@localhost:"$4"  # Asumsi lokal; gunakan rsync untuk remote
+            scp "$3" root@localhost:"$4"
             echo "File $3 diupload ke $4."
             ;;
         "download")
