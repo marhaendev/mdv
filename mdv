@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# mdv - VPS Management Tool (Multi-Distro Compatible)
-# Versi: 1.3 (Fixed port management; Expanded doctor for all dependencies; Fixed jq syntax in domain handling)
+# mdv - VPS Management Tool (14 Fitur Utama)
+# Versi: 1.0
 # Kompatibel: AlmaLinux/RHEL/Fedora (dnf/yum, firewalld), Debian/Ubuntu (apt, ufw fallback)
 
 # Deteksi Distribusi
@@ -100,7 +100,7 @@ is_valid_port() {
 # Fungsi utama: Help
 show_help() {
     cat << EOF
-mdv - VPS Management Tool (Kompatibel Multi-Distro)
+mdv - VPS Management Tool (14 Fitur Utama)
 
 Penggunaan: mdv <category> <subcommand> [args]
 
@@ -198,100 +198,33 @@ Penggunaan: mdv <category> <subcommand> [args]
     mdv monitor cpu --threshold 90  # Alert CPU
     mdv monitor disk --threshold 80 # Alert Disk
 
-15. Docker Management
-    mdv docker up <compose.yml>  # Jalankan compose
-    mdv docker ps                # Daftar container
-    mdv docker stop <container>  # Stop
-    mdv docker logs <container>  # Log
-
-16. Config Management
-    mdv config export <file.json>  # Ekspor
-    mdv config import <file.json>  # Impor
-    mdv config show                # Tampilkan
-    mdv config reset               # Reset semua
-
-17. Utility
-    mdv init | i                  # Inisialisasi: Install semua dependensi
-    mdv doctor                    # Cek status
-    mdv version                   # Versi
-    mdv help                      # Bantuan ini
-    mdv update                    # Update dari GitHub
-
-18. Pterodactyl Management
-    mdv ptero install panel       # Install panel
-    mdv ptero install wings       # Install wings
-    mdv ptero status              # Status
-    mdv ptero restart <panel|wings>   # Restart
-    mdv ptero logs <panel|wings>      # Log
-
-19. Mail Server
-    mdv mail install              # Install postfix/dovecot
-    mdv mail send <to> <subject>  # Kirim test
-    mdv mail status               # Status
-    mdv mail log                  # Log
-
-20. Load Balancer
-    mdv lb add <domain> <port1> ...  # Buat LB
-    mdv lb rm <domain>               # Hapus
-    mdv lb list                      # Daftar
-
-21. File Management
-    mdv file upload <local> <remote>  # Upload
-    mdv file download <remote> <local> # Download
-    mdv file list <dir>               # List file
-
-22. Cache / Redis
-    mdv redis install               # Install
-    mdv redis flushall              # Hapus data
-    mdv redis cli                   # Buka CLI
-
-23. Kubernetes / K3s
-    mdv k3s install                 # Install k3s
-    mdv k3s status                  # Status
-    mdv k3s node list               # List node
-
-24. AI/ML Helper
-    mdv ai install pytorch          # Install PyTorch
-    mdv ai install tensorflow       # Install TensorFlow
-    mdv ai jupyter enable           # Setup Jupyter
-
-25. Deployment Shortcuts
-    mdv deploy laravel <domain> <dir>  # Deploy Laravel
-    mdv deploy node <domain> <dir>     # Deploy Node
-    mdv deploy go <domain> <dir>       # Deploy Go
-
-26. Stack Installer
-    mdv stack lamp                  # LAMP stack
-    mdv stack lemp                  # LEMP stack
-    mdv stack mean                  # MEAN stack
-    mdv stack mevn                  # MEVN stack
-
 EOF
     exit 0
 }
 
-# Init/Install Dependencies
+# Init/Install Dependencies (Sesuaikan untuk 14 fitur)
 handle_init() {
     check_root
-    echo "Memulai inisialisasi mdv: Menginstal dependensi dasar..."
+    echo "Memulai inisialisasi mdv: Menginstal dependensi untuk 14 fitur..."
     detect_os
 
-    # Paket dasar umum
+    # Paket dasar
     CORE_PKGS="jq htop curl wget git"
     pkg_install $CORE_PKGS
 
-    # Web Server (Nginx)
-    if ! command -v nginx >/dev/null 2>&1; then
-        pkg_install nginx
-        systemctl enable --now nginx
-    fi
+    # Nginx & Certbot
+    pkg_install nginx
+    systemctl enable --now nginx
+    pkg_install certbot python3-certbot-nginx
 
-    # Database (MariaDB)
-    if ! command -v mysql >/dev/null 2>&1; then
-        pkg_install mariadb-server
-        systemctl enable --now mariadb
-        mysql_secure_installation  # Jalankan interaktif untuk setup aman
-    fi
+    # MariaDB
+    pkg_install mariadb-server
+    systemctl enable --now mariadb
+    mysql_secure_installation  # Interaktif
+
+    # PostgreSQL
+    pkg_install postgresql postgresql-contrib
+    systemctl enable --now postgresql
 
     # Firewall
     case $OS in
@@ -309,60 +242,23 @@ handle_init() {
     esac
 
     # Node.js & PM2
-    if ! command -v node >/dev/null 2>&1; then
-        pkg_install nodejs npm
-        npm install -g pm2
-    fi
+    pkg_install nodejs npm
+    npm install -g pm2
 
     # Golang
-    if ! command -v go >/dev/null 2>&1; then
-        pkg_install golang
-    fi
-
-    # Docker
-    if ! command -v docker >/dev/null 2>&1; then
-        case $OS in
-            "almalinux"|"rhel"|"centos"|"fedora")
-                pkg_install docker docker-compose
-                ;;
-            "ubuntu"|"debian")
-                pkg_install docker.io docker-compose
-                ;;
-        esac
-        systemctl enable --now docker
-        usermod -aG docker root  # Tambah root ke grup docker
-    fi
-
-    # Redis
-    pkg_install redis-server
-    systemctl enable --now redis-server
-
-    # PostgreSQL
-    pkg_install postgresql postgresql-contrib
-    systemctl enable --now postgresql
-
-    # Mail (Postfix/Dovecot)
-    pkg_install postfix dovecot-core
-    systemctl enable --now postfix dovecot
+    pkg_install golang
 
     # Fail2ban
     pkg_install fail2ban
     systemctl enable --now fail2ban
 
-    # PHP & Composer (untuk PMA, Laravel)
-    pkg_install php php-fpm php-mysql php-mysqli composer
+    # PHP & phpMyAdmin
+    pkg_install php php-fpm php-mysql php-mysqli phpmyadmin composer
 
-    # Pterodactyl dependensi dasar
-    pkg_install supervisor
-
-    # AI/ML (Python)
-    pkg_install python3 python3-pip
-
-    echo "Inisialisasi selesai! Jalankan 'mdv doctor' untuk verifikasi."
-    echo "Catatan: Beberapa setup (seperti mysql_secure_installation) memerlukan interaksi manual."
+    echo "Inisialisasi selesai. Jalankan 'mdv doctor' untuk verifikasi."
 }
 
-# 1. Port Management (Diperbaiki)
+# 1. Port Management
 handle_port() {
     SUB=$2
     case $SUB in
@@ -413,7 +309,7 @@ handle_port() {
     esac
 }
 
-# 2. Domain Management (Diperbaiki: jq syntax)
+# 2. Domain Management
 handle_domain() {
     check_root
     SUB=$2
@@ -735,7 +631,7 @@ handle_security() {
     esac
 }
 
-# 10. Database Management (MySQL/MariaDB)
+# 10. Database Management
 handle_db() {
     check_root
     if ! command -v mysql >/dev/null 2>&1; then
@@ -764,7 +660,6 @@ handle_db() {
     esac
 }
 
-# PostgreSQL
 handle_pg() {
     check_root
     if ! command -v psql >/dev/null 2>&1; then
@@ -935,391 +830,32 @@ handle_monitor() {
     esac
 }
 
-# 15. Docker Management
-handle_docker() {
-    check_root
-    if ! command -v docker >/dev/null 2>&1; then
-        case $OS in
-            "almalinux"|"rhel"|"centos"|"fedora")
-                pkg_install docker docker-compose
-                ;;
-            "ubuntu"|"debian")
-                pkg_install docker.io docker-compose
-                ;;
-        esac
-        systemctl enable --now docker
-    fi
-    SUB=$2
-    case $SUB in
-        "up")
-            docker-compose -f "$3" up -d
-            ;;
-        "ps")
-            docker ps
-            ;;
-        "stop")
-            docker stop "$3"
-            ;;
-        "logs")
-            docker logs "$3"
-            ;;
-        *)
-            echo "Usage: mdv docker {up <compose.yml>|ps|stop <container>|logs <container>}"
-            ;;
-    esac
-}
-
-# 16. Config Management
-handle_config() {
-    SUB=$2
-    case $SUB in
-        "export")
-            load_config > "$3"
-            echo "Config diekspor ke $3."
-            ;;
-        "import")
-            cp "$3" "$CONFIG_FILE"
-            echo "Config diimpor dari $3."
-            ;;
-        "show")
-            load_config
-            ;;
-        "reset")
-            rm -f "$CONFIG_FILE"
-            echo "Semua konfigurasi mdv direset."
-            ;;
-        *)
-            echo "Usage: mdv config {export <file.json>|import <file.json>|show|reset}"
-            ;;
-    esac
-}
-
-# 17. Utility (Diperluas: Doctor cek semua dependensi)
+# Utility (Diperluas: Doctor cek dependensi 14 fitur)
 handle_utility() {
     case $1 in
         "doctor")
-            echo "=== Status Dependensi mdv ==="
-            # Core
+            echo "=== Status Dependensi mdv (14 Fitur) ==="
             command -v jq >/dev/null && echo "jq: OK" || echo "jq: Error"
             command -v htop >/dev/null && echo "htop: OK" || echo "htop: Error"
-            # Web & Proxy
             systemctl is-active --quiet nginx && echo "Nginx: OK" || echo "Nginx: Error"
-            # Database
             systemctl is-active --quiet mariadb && echo "MariaDB: OK" || echo "MariaDB: Error"
             command -v psql >/dev/null && echo "PostgreSQL: OK" || echo "PostgreSQL: Error"
-            # Firewall
             fw_cmd "list-ports" > /dev/null 2>&1 && echo "Firewall: OK" || echo "Firewall: Error"
-            # Node.js & PM2
             command -v node >/dev/null && echo "Node.js: OK" || echo "Node.js: Error"
             command -v pm2 >/dev/null && echo "PM2: OK" || echo "PM2: Error"
-            # Golang
             command -v go >/dev/null && echo "Golang: OK" || echo "Golang: Error"
-            # Docker
-            systemctl is-active --quiet docker && echo "Docker: OK" || echo "Docker: Error"
-            # Cache
-            systemctl is-active --quiet redis-server && echo "Redis: OK" || echo "Redis: Error"
-            # Security
             systemctl is-active --quiet fail2ban && echo "Fail2ban: OK" || echo "Fail2ban: Error"
-            # PHP
             command -v php >/dev/null && echo "PHP: OK" || echo "PHP: Error"
-            # Mail
-            systemctl is-active --quiet postfix && echo "Postfix: OK" || echo "Postfix: Error"
-            systemctl is-active --quiet dovecot && echo "Dovecot: OK" || echo "Dovecot: Error"
-            # Pterodactyl
-            systemctl is-active --quiet supervisor && echo "Supervisor (Pterodactyl): OK" || echo "Supervisor (Pterodactyl): Error"
-            # AI/ML
-            command -v python3 >/dev/null && echo "Python3: OK" || echo "Python3: Error"
-            # K3s
-            command -v kubectl >/dev/null && echo "K3s/Kubectl: OK" || echo "K3s/Kubectl: Error"
             echo "=== End Status ==="
             ;;
         "version")
-            echo "mdv v1.3"
+            echo "mdv v1.0 (14 Fitur)"
             ;;
         "help")
             show_help
             ;;
-        "update")
-            cd /opt/mdv && git pull origin main 2>/dev/null || echo "Update gagal; clone repo manual."
-            ;;
         *)
             show_help
-            ;;
-    esac
-}
-
-# 18. Pterodactyl Management
-handle_ptero() {
-    check_root
-    SUB=$2
-    case $SUB in
-        "install")
-            case $3 in
-                "panel")
-                    pkg_install nodejs npm composer php php-fpm php-mysql
-                    curl -L -o /tmp/panel.tar.gz https://github.com/pterodactyl/panel/releases/latest/download/panel.tar.gz
-                    tar -xzf /tmp/panel.tar.gz -C /var/www/
-                    cd /var/www/panel && composer install --no-dev --optimize-autoloader
-                    read -p "Masukkan domain: " DOMAIN
-                    read -p "Masukkan port: " PORT
-                    echo "Panel Pterodactyl diinstal di $DOMAIN:$PORT. Jalankan setup manual di browser."
-                    ;;
-                "wings")
-                    curl -L https://github.com/pterodactyl/wings/releases/latest/download/wings_linux_amd64 -o /usr/local/bin/wings
-                    chmod u+x /usr/local/bin/wings
-                    pkg_install supervisor
-                    echo "Wings Pterodactyl diinstal. Konfigurasi di /etc/supervisor/conf.d/wings.conf."
-                    ;;
-            esac
-            ;;
-        "status")
-            systemctl status pterodactyl-panel wings 2>/dev/null || echo "Service tidak ditemukan."
-            ;;
-        "restart")
-            systemctl restart "$4"
-            ;;
-        "logs")
-            journalctl -u "$4" -f 2>/dev/null || echo "Log tidak tersedia."
-            ;;
-        *)
-            echo "Usage: mdv ptero {install panel|install wings|status|restart <panel|wings>|logs <panel|wings>}"
-            ;;
-    esac
-}
-
-# 19. Mail Server
-handle_mail() {
-    check_root
-    SUB=$2
-    case $SUB in
-        "install")
-            pkg_install postfix dovecot-core
-            systemctl enable --now postfix dovecot
-            echo "Mail server (Postfix/Dovecot) diinstal."
-            ;;
-        "send")
-            TO=$3
-            SUBJECT=$4
-            echo "Test body" | mail -s "$SUBJECT" "$TO"
-            echo "Email test dikirim ke $TO."
-            ;;
-        "status")
-            systemctl status postfix dovecot
-            ;;
-        "log")
-            journalctl -u postfix -f
-            ;;
-        *)
-            echo "Usage: mdv mail {install|send <to> <subject>|status|log}"
-            ;;
-    esac
-}
-
-# 20. Load Balancer
-handle_lb() {
-    check_root
-    SUB=$2
-    case $SUB in
-        "add")
-            DOMAIN=$3
-            shift 3
-            PORTS="$*"
-            cat >> /etc/nginx/nginx.conf << EOF
-
-upstream backend_$DOMAIN {
-$(for p in $PORTS; do echo "    server 127.0.0.1:$p;"; done)
-}
-
-server {
-    listen 80;
-    server_name $DOMAIN;
-    location / {
-        proxy_pass http://backend_$DOMAIN;
-    }
-}
-EOF
-            nginx -t && systemctl reload nginx
-            echo "Load balancer untuk $DOMAIN dengan ports $PORTS dibuat."
-            ;;
-        "rm")
-            sed -i "/upstream backend_$3/,/server {/,/}/d" /etc/nginx/nginx.conf
-            nginx -t && systemctl reload nginx
-            echo "Load balancer $3 dihapus."
-            ;;
-        "list")
-            grep -A10 "upstream" /etc/nginx/nginx.conf
-            ;;
-        *)
-            echo "Usage: mdv lb {add <domain> <port1> <port2>...|rm <domain>|list}"
-            ;;
-    esac
-}
-
-# 21. File Management
-handle_file() {
-    SUB=$2
-    case $SUB in
-        "upload")
-            scp "$3" root@localhost:"$4"
-            echo "File $3 diupload ke $4."
-            ;;
-        "download")
-            scp root@localhost:"$3" "$4"
-            echo "File $3 didownload ke $4."
-            ;;
-        "list")
-            ls -la "$3"
-            ;;
-        *)
-            echo "Usage: mdv file {upload <local> <remote>|download <remote> <local>|list <dir>}"
-            ;;
-    esac
-}
-
-# 22. Cache / Redis
-handle_redis() {
-    check_root
-    SUB=$2
-    case $SUB in
-        "install")
-            pkg_install redis-server
-            systemctl enable --now redis-server
-            echo "Redis diinstal."
-            ;;
-        "flushall")
-            redis-cli FLUSHALL
-            ;;
-        "cli")
-            redis-cli
-            ;;
-        *)
-            echo "Usage: mdv redis {install|flushall|cli}"
-            ;;
-    esac
-}
-
-# 23. Kubernetes / K3s
-handle_k3s() {
-    check_root
-    SUB=$2
-    case $SUB in
-        "install")
-            curl -sfL https://get.k3s.io | sh -
-            echo "K3s diinstal."
-            ;;
-        "status")
-            systemctl status k3s
-            ;;
-        "node")
-            case $3 in
-                "list")
-                    kubectl get nodes
-                    ;;
-            esac
-            ;;
-        *)
-            echo "Usage: mdv k3s {install|status|node list}"
-            ;;
-    esac
-}
-
-# 24. AI/ML Helper
-handle_ai() {
-    check_root
-    if ! command -v python3 >/dev/null 2>&1; then
-        pkg_install python3 python3-pip
-    fi
-    SUB=$2
-    case $SUB in
-        "install")
-            case $3 in
-                "pytorch")
-                    python3 -m pip install torch torchvision
-                    ;;
-                "tensorflow")
-                    python3 -m pip install tensorflow
-                    ;;
-            esac
-            echo "$3 diinstal."
-            ;;
-        "jupyter")
-            case $3 in
-                "enable")
-                    python3 -m pip install jupyter
-                    jupyter notebook --generate-config
-                    echo "Jupyter diaktifkan. Jalankan 'jupyter notebook' untuk start."
-                    ;;
-            esac
-            ;;
-        *)
-            echo "Usage: mdv ai {install pytorch|install tensorflow|jupyter enable}"
-            ;;
-    esac
-}
-
-# 25. Deployment Shortcuts
-handle_deploy() {
-    check_root
-    TYPE=$2
-    DOMAIN=$3
-    DIR=$4
-    case $TYPE in
-        "laravel")
-            pkg_install composer php php-fpm php-mysql
-            cd "$DIR" && composer install --no-dev --optimize-autoloader
-            mdv app add "$DOMAIN" 8000
-            mdv domain add "$DOMAIN" $(curl -s ifconfig.me)
-            echo "Laravel di-deploy ke $DOMAIN di $DIR."
-            ;;
-        "node")
-            pkg_install nodejs npm
-            cd "$DIR" && npm install
-            mdv app add "$DOMAIN" 3000
-            mdv node start "$DIR" "$DOMAIN"
-            echo "Node.js di-deploy ke $DOMAIN di $DIR."
-            ;;
-        "go")
-            pkg_install golang
-            cd "$DIR" && go mod tidy && go build -o app
-            mdv app add "$DOMAIN" 8080
-            mdv go start "$DIR/app" "$DOMAIN" 8080
-            echo "Go di-deploy ke $DOMAIN di $DIR."
-            ;;
-        *)
-            echo "Usage: mdv deploy {laravel|node|go} <domain> <dir>"
-            ;;
-    esac
-}
-
-# 26. Stack Installer
-handle_stack() {
-    check_root
-    SUB=$2
-    case $SUB in
-        "lamp")
-            pkg_install apache2 mariadb-server php libapache2-mod-php php-mysql
-            systemctl enable --now apache2 mariadb
-            echo "LAMP stack diinstal."
-            ;;
-        "lemp")
-            pkg_install nginx mariadb-server php-fpm php-mysql
-            systemctl enable --now nginx mariadb
-            echo "LEMP stack diinstal."
-            ;;
-        "mean")
-            pkg_install mongodb nodejs npm
-            npm install -g @angular/cli express-generator
-            systemctl enable --now mongod
-            echo "MEAN stack diinstal."
-            ;;
-        "mevn")
-            pkg_install mongodb nodejs npm
-            npm install -g @vue/cli express-generator
-            systemctl enable --now mongod
-            echo "MEVN stack diinstal."
-            ;;
-        *)
-            echo "Usage: mdv stack {lamp|lemp|mean|mevn}"
             ;;
     esac
 }
@@ -1346,17 +882,6 @@ case $CATEGORY in
     "user") handle_user "$@";;
     "sys") handle_sys "$@";;
     "monitor") handle_monitor "$@";;
-    "docker") handle_docker "$@";;
-    "config") handle_config "$@";;
-    "doctor"|"version"|"help"|"update") handle_utility "$@";;
-    "ptero") handle_ptero "$@";;
-    "mail") handle_mail "$@";;
-    "lb") handle_lb "$@";;
-    "file") handle_file "$@";;
-    "redis") handle_redis "$@";;
-    "k3s") handle_k3s "$@";;
-    "ai") handle_ai "$@";;
-    "deploy") handle_deploy "$@";;
-    "stack") handle_stack "$@";;
+    "doctor"|"version"|"help") handle_utility "$@";;
     *) show_help;;
 esac
