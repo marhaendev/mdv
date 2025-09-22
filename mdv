@@ -1,267 +1,1223 @@
-#!/usr/bin/env bash
-# mdv - Minimal DevOps CLI
-# Version: 1.0.0
+#!/bin/bash
 
-set -euo pipefail
+# mdv - VPS Management Tool (Multi-Distro Compatible)
+# Versi: 1.1
+# Kompatibel: AlmaLinux/RHEL/Fedora (dnf/yum, firewalld), Debian/Ubuntu (apt, ufw fallback)
 
-VERSION="1.0.0"
-CONFIG_TAG="# mdv"
-HOSTS_FILE="/etc/hosts"
-NGINX_CONF_DIR="/etc/nginx/conf.d"
-FIREWALL_CMD="$(command -v firewall-cmd || true)"
-CERTBOT_CMD="$(command -v certbot || true)"
-JQ_CMD="$(command -v jq || true)"
-
-die(){ echo "Error: $*" >&2; exit 1; }
-exists(){ command -v "$1" >/dev/null 2>&1; }
-
-# --- Firewall (Port) ---
-fw_ports_all() {
-  local runtime permanent
-  runtime="$($FIREWALL_CMD --quiet --list-ports || true)"
-  permanent="$($FIREWALL_CMD --quiet --permanent --list-ports || true)"
-  printf "%s %s\n" "$runtime" "$permanent" | tr ' ' '\n' | sort -u | sed '/^$/d'
+# Deteksi Distribusi
+detect_os() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        OS=$ID
+        VER=$VERSION_ID
+    else
+        echo "Error: Tidak dapat mendeteksi OS."
+        exit 1
+    fi
 }
 
-listening_ports() {
-  ss -tuln | awk 'NR>1 {proto=$1; split($5,a,":"); port=a[length(a)];
-    if (port ~ /^[0-9]+$/) printf "%s/%s\n", port, proto}' | sort -u
+# Fungsi helper: Package Manager
+pkg_install() {
+    detect_os
+    case $OS in
+        "almalinux"|"rhel"|"centos"|"fedora")
+            if command -v dnf >/dev/null 2>&1; then
+                dnf install -y "$@"
+            else
+                yum install -y "$@"
+            fi
+            ;;
+        "ubuntu"|"debian")
+            apt update && apt install -y "$@"
+            ;;
+        *)
+            echo "Error: Package manager tidak didukung untuk $OS."
+            exit 1
+            ;;
+    esac
 }
 
-port_list() {
-  local mode="${1:-all}"
-  mapfile -t allowed < <(fw_ports_all)
-  mapfile -t listening < <(listening_ports)
-  declare -A allowed_set; for p in "${allowed[@]}"; do allowed_set["$p"]=1; done
-
-  [[ "$mode" == "on" || "$mode" == "all" ]] && {
-    echo "=== Allowed ports ==="
-    ((${#allowed[@]})) && printf '%s\n' "${allowed[@]}" || echo "(none)"
-    echo
-  }
-  [[ "$mode" == "off" || "$mode" == "all" ]] && {
-    echo "=== Listening but not allowed ==="
-    off=()
-    for p in "${listening[@]}"; do [[ -z "${allowed_set[$p]:-}" ]] && off+=("$p"); done
-    ((${#off[@]})) && printf '%s\n' "${off[@]}" || echo "(none)"
-  }
+# Fungsi helper: Firewall (firewalld prioritas, fallback ufw)
+fw_cmd() {
+    if command -v firewall-cmd >/dev/null 2>&1; then
+        case $1 in
+            "list-ports") firewall-cmd --list-ports ;;
+            "add-port") firewall-cmd --permanent --add-port="$2/$3" && firewall-cmd --reload ;;
+            "remove-port") firewall-cmd --permanent --remove-port="$2/$3" && firewall-cmd --reload ;;
+            "query-port") firewall-cmd --query-port="$2/$3" ;;
+            "list-all") firewall-cmd --list-all ;;
+            "add-rich-rule") firewall-cmd --permanent --add-rich-rule="$2" && firewall-cmd --reload ;;
+            "panic-off") firewall-cmd --panic-off && firewall-cmd --reload ;;
+        esac
+    elif command -v ufw >/dev/null 2>&1; then
+        case $1 in
+            "list-ports") ufw status numbered ;;
+            "add-port") ufw allow "$2/$3" && ufw reload ;;
+            "remove-port") ufw delete allow "$2/$3" && ufw reload ;;
+            "query-port") ufw status | grep "$2/$3" >/dev/null 2>&1 && echo true || echo false ;;
+            "list-all") ufw status verbose ;;
+            "add-rich-rule") echo "UFW tidak mendukung rich rules; gunakan allow/deny manual." ;;
+            "panic-off") ufw reset --force && ufw enable ;;
+        esac
+    else
+        echo "Error: Firewall tool tidak ditemukan. Install firewalld atau ufw."
+        exit 1
+    fi
 }
 
-port_enable() {
-  local port="$1" proto="${2:-tcp}"
-  $FIREWALL_CMD --add-port="$port/$proto"
-  $FIREWALL_CMD --permanent --add-port="$port/$proto"
-  $FIREWALL_CMD --reload
-  echo "✅ Enabled $port/$proto"
+# Direktori konfigurasi
+CONFIG_DIR="$HOME/.mdv"
+CONFIG_FILE="$CONFIG_DIR/config.json"
+mkdir -p "$CONFIG_DIR"
+
+# Fungsi helper: Load config JSON
+load_config() {
+    if command -v jq >/dev/null 2>&1; then
+        cat "$CONFIG_FILE" 2>/dev/null | jq . || echo "{}"
+    else
+        echo "{}"
+        if [ ! -f "$CONFIG_FILE" ]; then
+            pkg_install jq
+        fi
+    fi
 }
 
-port_disable() {
-  local port="$1" proto="${2:-tcp}"
-  $FIREWALL_CMD --remove-port="$port/$proto" || true
-  $FIREWALL_CMD --permanent --remove-port="$port/$proto" || true
-  $FIREWALL_CMD --reload
-  echo "🛑 Disabled $port/$proto"
+# Fungsi helper: Save config
+save_config() {
+    echo "$1" > "$CONFIG_FILE"
 }
 
-# --- Domain (/etc/hosts) ---
-domain_add() {
-  local domain="$1" ip="$2"
-  sed -i -E "/[[:space:]]$domain([[:space:]]|\$)/d" "$HOSTS_FILE"
-  echo "$ip $domain $CONFIG_TAG" >> "$HOSTS_FILE"
-  echo "✅ Added $domain -> $ip"
+# Fungsi helper: Cek root
+check_root() {
+    if [ "$EUID" -ne 0 ]; then
+        echo "Error: Jalankan sebagai root atau dengan sudo."
+        exit 1
+    fi
 }
 
-domain_rm() {
-  local domain="$1"
-  sed -i -E "/[[:space:]]$domain([[:space:]]|\$)/d" "$HOSTS_FILE"
-  echo "🗑 Removed $domain"
+# Fungsi utama: Help
+show_help() {
+    cat << EOF
+mdv - VPS Management Tool (Kompatibel Multi-Distro)
+
+Penggunaan: mdv <category> <subcommand> [args]
+
+1. Port Management (firewalld)
+   mdv port list          # Semua port (allowed + listening-not-allowed)
+   mdv port list on       # Port yang dibuka di firewall
+   mdv port list off      # Port listen tapi belum dibuka
+   mdv port e <port> [tcp|udp]  # Buka port (default tcp)
+   mdv port d <port> [tcp|udp]  # Tutup port
+   mdv port reset         # Reset firewall ke default
+
+2. Domain Management (/etc/hosts)
+   mdv domain add <domain> <ip>  # Arahkan domain ke IP (lokal VPS)
+   mdv domain rm <domain>        # Hapus mapping
+   mdv domain list               # Daftar domain
+   mdv domain check <domain>     # Cek resolve ke IP VPS
+
+3. App Management (Nginx reverse proxy)
+   mdv app add <domain> <port>   # Buat config nginx: domain → 127.0.0.1:<port>
+   mdv app rm <domain>           # Hapus config
+   mdv app list                  # Daftar config
+   mdv app ssl <domain>          # Pasang Let's Encrypt SSL
+   mdv app unssl <domain>        # Hapus SSL
+   mdv app info <domain>         # Detail config
+
+4. phpMyAdmin Management
+   mdv pma add <domain>          # Install & setup phpMyAdmin
+   mdv pma rm <domain>           # Hapus config
+   mdv pma list                  # Daftar domain
+
+5. Node.js App Runner (pm2)
+   mdv node start <dir> <name>   # Jalankan via pm2
+   mdv node stop <name>          # Stop
+   mdv node restart <name>       # Restart
+   mdv node list                 # List app
+   mdv node logs <name>          # Lihat log
+
+6. Golang App Runner (systemd)
+   mdv go start <binary> <name> <port>  # Jalankan binary
+   mdv go stop <name>                  # Stop
+   mdv go restart <name>               # Restart
+   mdv go list                         # List app
+   mdv go logs <name>                  # Lihat log
+
+7. Scheduler (Cron helper)
+   mdv cron add "<schedule>" "<command>"  # Tambah job (e.g., "* * * * *")
+   mdv cron list                          # List job
+   mdv cron rm <id>                       # Hapus job
+
+8. Timer (systemd)
+   mdv timer add "<interval>" "<command>"  # e.g., "10s"
+   mdv timer list                         # List job
+   mdv timer rm <name>                    # Hapus job
+
+9. Security
+   mdv ssh port <newport>         # Ganti SSH port
+   mdv ssh disable-root           # Disable root login
+   mdv ssh enable-root            # Enable root login
+   mdv fail2ban install           # Setup fail2ban
+   mdv fw allow <ip>              # Whitelist IP
+   mdv fw deny <ip>               # Blacklist IP
+   mdv fw list                    # List aturan
+
+10. Database Management
+    mdv db create <name> <user> <pass>  # MySQL/MariaDB
+    mdv db drop <name>                  # Hapus DB
+    mdv db list                         # Daftar DB
+    mdv pg create <name> <user> <pass>  # PostgreSQL
+    mdv pg drop <name>                  # Hapus DB
+    mdv pg list                         # Daftar DB
+
+11. SSL Management
+    mdv ssl issue <domain>     # Pasang Let's Encrypt
+    mdv ssl renew <domain>     # Perpanjang
+    mdv ssl list               # Daftar cert
+    mdv ssl revoke <domain>    # Hapus cert
+
+12. Backup & Restore
+    mdv backup app <domain>    # Backup nginx + SSL
+    mdv backup db <name>       # Backup DB
+    mdv backup all             # Backup semua
+    mdv restore <file>         # Restore dari file
+
+13. User Management
+    mdv user add <username>    # Tambah user
+    mdv user rm <username>     # Hapus user
+    mdv user list              # Daftar user
+    mdv user passwd <username> # Ubah password
+
+14. System Info & Monitoring
+    mdv sys info               # Detail VPS
+    mdv sys usage              # Usage CPU/RAM/Disk
+    mdv sys top                # Proses (mirip htop)
+    mdv monitor enable <webhook>  # Aktifkan notif Telegram
+    mdv monitor cpu --threshold 90  # Alert CPU
+    mdv monitor disk --threshold 80 # Alert Disk
+
+15. Docker Management
+    mdv docker up <compose.yml>  # Jalankan compose
+    mdv docker ps                # Daftar container
+    mdv docker stop <container>  # Stop
+    mdv docker logs <container>  # Log
+
+16. Config Management
+    mdv config export <file.json>  # Ekspor
+    mdv config import <file.json>  # Impor
+    mdv config show                # Tampilkan
+    mdv config reset               # Reset semua
+
+17. Utility
+    mdv doctor                    # Cek status
+    mdv version                   # Versi
+    mdv help                      # Bantuan ini
+    mdv update                    # Update dari GitHub
+
+18. Pterodactyl Management
+    mdv ptero install panel       # Install panel
+    mdv ptero install wings       # Install wings
+    mdv ptero status              # Status
+    mdv ptero restart <panel|wings>   # Restart
+    mdv ptero logs <panel|wings>      # Log
+
+19. Mail Server
+    mdv mail install              # Install postfix/dovecot
+    mdv mail send <to> <subject>  # Kirim test
+    mdv mail status               # Status
+    mdv mail log                  # Log
+
+20. Load Balancer
+    mdv lb add <domain> <port1> ...  # Buat LB
+    mdv lb rm <domain>               # Hapus
+    mdv lb list                      # Daftar
+
+21. File Management
+    mdv file upload <local> <remote>  # Upload
+    mdv file download <remote> <local> # Download
+    mdv file list <dir>               # List file
+
+22. Cache / Redis
+    mdv redis install               # Install
+    mdv redis flushall              # Hapus data
+    mdv redis cli                   # Buka CLI
+
+23. Kubernetes / K3s
+    mdv k3s install                 # Install k3s
+    mdv k3s status                  # Status
+    mdv k3s node list               # List node
+
+24. AI/ML Helper
+    mdv ai install pytorch          # Install PyTorch
+    mdv ai install tensorflow       # Install TensorFlow
+    mdv ai jupyter enable           # Setup Jupyter
+
+25. Deployment Shortcuts
+    mdv deploy laravel <domain> <dir>  # Deploy Laravel
+    mdv deploy node <domain> <dir>     # Deploy Node
+    mdv deploy go <domain> <dir>       # Deploy Go
+
+26. Stack Installer
+    mdv stack lamp                  # LAMP stack
+    mdv stack lemp                  # LEMP stack
+    mdv stack mean                  # MEAN stack
+    mdv stack mevn                  # MEVN stack
+
+EOF
+    exit 0
 }
 
-domain_list() {
-  echo "=== mdv domains ==="
-  grep "$CONFIG_TAG" "$HOSTS_FILE" || echo "(none)"
+# 1. Port Management
+handle_port() {
+    SUB=$2
+    case $SUB in
+        "list")
+            if [ "$3" = "on" ]; then
+                fw_cmd "list-ports"
+            elif [ "$3" = "off" ]; then
+                ss -tuln | awk '{print $5}' | cut -d: -f2 | sort -u | while read p; do
+                    QUERY_TCP=$(fw_cmd "query-port" "$p" "tcp")
+                    QUERY_UDP=$(fw_cmd "query-port" "$p" "udp")
+                    if [ "$QUERY_TCP" != "yes" ] && [ "$QUERY_UDP" != "yes" ]; then
+                        echo "Port $p (listening, not allowed)"
+                    fi
+                done
+            else
+                ss -tuln | awk '{print $5}' | cut -d: -f2 | sort -u
+                echo "--- Allowed Ports ---"
+                fw_cmd "list-ports"
+            fi
+            ;;
+        "e")
+            PROTO=${3:-tcp}
+            fw_cmd "add-port" "$2" "$PROTO"
+            echo "Port $2/$PROTO dibuka."
+            ;;
+        "d")
+            PROTO=${3:-tcp}
+            fw_cmd "remove-port" "$2" "$PROTO"
+            echo "Port $2/$PROTO ditutup."
+            ;;
+        "reset")
+            fw_cmd "panic-off"
+            echo "Firewall direset ke default."
+            ;;
+        *)
+            echo "Usage: mdv port {list [on|off]|e <port> [tcp|udp]|d <port> [tcp|udp]|reset}"
+            ;;
+    esac
 }
 
-domain_check() {
-  local domain="$1"
-  local resolved; resolved="$(getent hosts "$domain" | awk '{print $1}')"
-  echo "$domain resolves to: $resolved"
-  echo "Server IP: $(hostname -I | awk '{print $1}')"
+# 2. Domain Management
+handle_domain() {
+    check_root
+    SUB=$2
+    case $SUB in
+        "add")
+            echo "$3 $2" >> /etc/hosts
+            CONFIG=$(load_config)
+            NEW_CONFIG=$(echo "$CONFIG" | jq --arg domain "$2" --arg ip "$3" '. + {domains: (.domains // {}) + {($domain): $ip}}')
+            save_config "$NEW_CONFIG"
+            echo "Domain $2 ditambahkan ke $3."
+            ;;
+        "rm")
+            sed -i "/ $2$/d" /etc/hosts
+            CONFIG=$(load_config)
+            NEW_CONFIG=$(echo "$CONFIG" | jq 'del(.domains[$ARGS.positional[0]])' --arg domain "$2")
+            save_config "$NEW_CONFIG"
+            echo "Domain $2 dihapus."
+            ;;
+        "list")
+            grep -E "^[0-9]" /etc/hosts | awk '{print $2, $1}'
+            ;;
+        "check")
+            IP=$(nslookup $3 2>/dev/null | awk '/Address: / && !/127.0.0.1/ {print $2; exit}')
+            VPS_IP=$(curl -s ifconfig.me)
+            if [ "$IP" = "$VPS_IP" ]; then
+                echo "Domain $3 resolve ke VPS IP."
+            else
+                echo "Domain $3 tidak resolve ke VPS IP."
+            fi
+            ;;
+        *)
+            echo "Usage: mdv domain {add <domain> <ip>|rm <domain>|list|check <domain>}"
+            ;;
+    esac
 }
 
-# --- App (Nginx proxy) ---
-app_add() {
-  local domain="$1" port="$2"
-  local conf="$NGINX_CONF_DIR/$domain.conf"
-  cat > "$conf" <<EOF
+# 3. App Management (Nginx)
+handle_app() {
+    check_root
+    if ! command -v nginx >/dev/null 2>&1; then
+        pkg_install nginx
+        systemctl enable --now nginx
+    fi
+    SUB=$2
+    NGINX_CONF="/etc/nginx/sites-available/$2"
+    case $SUB in
+        "add")
+            PORT=$3
+            mkdir -p /etc/nginx/{sites-available,sites-enabled}
+            cat > "$NGINX_CONF" << EOF
 server {
     listen 80;
-    server_name $domain;
-
+    server_name $2;
     location / {
-        proxy_pass http://127.0.0.1:$port;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection 'upgrade';
-        proxy_set_header Host \$host;
-        proxy_cache_bypass \$http_upgrade;
+        proxy_pass http://127.0.0.1:$PORT;
     }
 }
 EOF
-  nginx -t && systemctl reload nginx
-  echo "✅ App $domain → 127.0.0.1:$port"
+            ln -sf "$NGINX_CONF" /etc/nginx/sites-enabled/
+            nginx -t && systemctl reload nginx
+            echo "App $2 ditambahkan ke port $PORT."
+            ;;
+        "rm")
+            rm -f "$NGINX_CONF" /etc/nginx/sites-enabled/"$2"
+            nginx -t && systemctl reload nginx
+            echo "App $2 dihapus."
+            ;;
+        "list")
+            ls /etc/nginx/sites-enabled/ 2>/dev/null | grep -v default || echo "Tidak ada config."
+            ;;
+        "ssl")
+            if ! command -v certbot >/dev/null 2>&1; then
+                pkg_install certbot python3-certbot-nginx
+            fi
+            certbot --nginx -d $3 -n
+            echo "SSL dipasang untuk $3."
+            ;;
+        "unssl")
+            certbot delete --cert-name $3 -n
+            echo "SSL dihapus untuk $3."
+            ;;
+        "info")
+            nginx -T 2>/dev/null | grep -A10 "server_name $3" || echo "Config tidak ditemukan."
+            ;;
+        *)
+            echo "Usage: mdv app {add <domain> <port>|rm <domain>|list|ssl <domain>|unssl <domain>|info <domain>}"
+            ;;
+    esac
 }
 
-app_rm() {
-  local domain="$1"
-  rm -f "$NGINX_CONF_DIR/$domain.conf"
-  nginx -t && systemctl reload nginx
-  echo "🗑 Removed app $domain"
+# 4. phpMyAdmin Management
+handle_pma() {
+    check_root
+    SUB=$2
+    case $SUB in
+        "add")
+            pkg_install phpmyadmin php-mysqli  # Paket disesuaikan per distro
+            # Setup dasar untuk domain (asumsi symlink ke /var/www/html/pma)
+            ln -s /usr/share/phpmyadmin /var/www/html/pma
+            echo "phpMyAdmin diinstal dan setup untuk $3."
+            ;;
+        "rm")
+            pkg_install --purge phpmyadmin  # Untuk Debian; gunakan rpm -e untuk RHEL
+            rm -rf /var/www/html/pma
+            echo "phpMyAdmin dihapus untuk $3."
+            ;;
+        "list")
+            ls /var/www/html/ 2>/dev/null | grep pma || echo "Tidak ada phpMyAdmin."
+            ;;
+        *)
+            echo "Usage: mdv pma {add <domain>|rm <domain>|list}"
+            ;;
+    esac
 }
 
-app_list() {
-  ls $NGINX_CONF_DIR/*.conf 2>/dev/null || echo "(none)"
+# 5. Node.js App Runner (pm2)
+handle_node() {
+    check_root
+    if ! command -v pm2 >/dev/null 2>&1; then
+        pkg_install nodejs npm
+        npm install -g pm2
+    fi
+    SUB=$2
+    case $SUB in
+        "start")
+            DIR=$3
+            NAME=$4
+            cd "$DIR" && pm2 start npm --name "$NAME" -- start  # Asumsi package.json dengan "start"
+            pm2 save
+            echo "Node app $NAME dimulai dari $DIR."
+            ;;
+        "stop")
+            pm2 stop "$3"
+            ;;
+        "restart")
+            pm2 restart "$3"
+            ;;
+        "list")
+            pm2 list
+            ;;
+        "logs")
+            pm2 logs "$3"
+            ;;
+        *)
+            echo "Usage: mdv node {start <dir> <name>|stop <name>|restart <name>|list|logs <name>}"
+            ;;
+    esac
 }
 
-app_ssl() {
-  local domain="$1"
-  [[ -z "$CERTBOT_CMD" ]] && die "certbot not installed. Run: dnf install -y certbot python3-certbot-nginx"
-  $CERTBOT_CMD --nginx -d "$domain"
-}
+# 6. Golang App Runner (systemd)
+handle_go() {
+    check_root
+    SUB=$2
+    SERVICE_FILE="/etc/systemd/system/$3.service"
+    case $SUB in
+        "start")
+            BINARY=$3
+            NAME=$4
+            PORT=$5
+            cat > "$SERVICE_FILE" << EOF
+[Unit]
+Description=Go App $NAME
 
-# --- Config (Export/Import JSON) ---
-config_export() {
-  local file="$1"
-  [[ -z "$JQ_CMD" ]] && die "jq not installed. Run: dnf install -y jq"
+[Service]
+ExecStart=$BINARY
+WorkingDirectory=/var/www
+Restart=always
+Environment=PORT=$PORT
 
-  echo "{" >"$file"
-
-  # Ports
-  echo '  "ports": [' >>"$file"
-  fw_ports_all | sed 's/^/    "/;s/$/",/' >>"$file"
-  sed -i '$ s/,$//' "$file"
-  echo '  ],' >>"$file"
-
-  # Domains
-  echo '  "domains": {' >>"$file"
-  grep "$CONFIG_TAG" "$HOSTS_FILE" | awk '{print $1, $2}' | \
-    sed 's/ /": "/;s/^/    "/;s/$/",/' >>"$file"
-  sed -i '$ s/,$//' "$file"
-  echo '  },' >>"$file"
-
-  # Apps
-  echo '  "apps": [' >>"$file"
-  for f in $NGINX_CONF_DIR/*.conf 2>/dev/null; do
-    d=$(basename "$f" .conf)
-    p=$(grep -oP '127\.0\.0\.1:\K[0-9]+' "$f" | head -1)
-    [[ -n "$p" ]] && echo "    {\"domain\": \"$d\", \"port\": $p, \"ssl\": false}," >>"$file"
-  done
-  sed -i '$ s/,$//' "$file"
-  echo '  ]' >>"$file"
-
-  echo "}" >>"$file"
-  echo "✅ Exported config to $file"
-}
-
-config_import() {
-  local file="$1"
-  [[ ! -f "$file" ]] && die "File not found: $file"
-  [[ -z "$JQ_CMD" ]] && die "jq not installed. Run: dnf install -y jq"
-
-  # Ports
-  $JQ_CMD -r '.ports[]' "$file" | while read -r pp; do
-    port="${pp%/*}"; proto="${pp#*/}"
-    port_enable "$port" "$proto"
-  done
-
-  # Domains
-  $JQ_CMD -r '.domains | to_entries[] | "\(.key) \(.value)"' "$file" | while read -r domain ip; do
-    domain_add "$domain" "$ip"
-  done
-
-  # Apps
-  $JQ_CMD -c '.apps[]' "$file" | while read -r app; do
-    domain=$(echo "$app" | $JQ_CMD -r .domain)
-    port=$(echo "$app" | $JQ_CMD -r .port)
-    ssl=$(echo "$app" | $JQ_CMD -r .ssl)
-    app_add "$domain" "$port"
-    [[ "$ssl" == "true" ]] && app_ssl "$domain"
-  done
-}
-
-# --- Utility ---
-doctor() {
-  echo "=== mdv doctor ==="
-  for s in firewalld nginx; do
-    systemctl is-active --quiet $s && echo "$s: running" || echo "$s: not running"
-  done
-  exists pm2 && echo "pm2: installed" || echo "pm2: not installed"
-  exists certbot && echo "certbot: installed" || echo "certbot: not installed"
-  exists jq && echo "jq: installed" || echo "jq: not installed"
-}
-
-usage() {
-  cat <<EOF
-mdv v$VERSION - Minimal DevOps CLI
-
-Usage:
-  mdv port list [on|off]
-  mdv port e <port> [proto]      # enable port
-  mdv port d <port> [proto]      # disable port
-
-  mdv domain add <domain> <ip>
-  mdv domain rm <domain>
-  mdv domain list
-  mdv domain check <domain>
-
-  mdv app add <domain> <port>
-  mdv app rm <domain>
-  mdv app list
-  mdv app ssl <domain>
-
-  mdv config export <file.json>
-  mdv config import <file.json>
-
-  mdv doctor
-  mdv version
-  mdv help
+[Install]
+WantedBy=multi-user.target
 EOF
+            systemctl daemon-reload
+            systemctl enable "$NAME"
+            systemctl start "$NAME"
+            echo "Go app $NAME dimulai di port $PORT."
+            ;;
+        "stop")
+            systemctl stop "$3"
+            ;;
+        "restart")
+            systemctl restart "$3"
+            ;;
+        "list")
+            systemctl list-units | grep go || echo "Tidak ada Go app."
+            ;;
+        "logs")
+            journalctl -u "$3" -f
+            ;;
+        *)
+            echo "Usage: mdv go {start <binary> <name> <port>|stop <name>|restart <name>|list|logs <name>}"
+            ;;
+    esac
 }
 
-# --- Main ---
-cmd="${1:-}"; shift || true
-case "$cmd" in
-  port) sub="${1:-}"; shift || true
-    case "$sub" in
-      list) port_list "${1:-all}";;
-      e) port_enable "$@";;
-      d) port_disable "$@";;
-      *) usage;;
-    esac;;
-  domain) sub="${1:-}"; shift || true
-    case "$sub" in
-      add) domain_add "$@";;
-      rm) domain_rm "$@";;
-      list) domain_list;;
-      check) domain_check "$@";;
-      *) usage;;
-    esac;;
-  app) sub="${1:-}"; shift || true
-    case "$sub" in
-      add) app_add "$@";;
-      rm) app_rm "$@";;
-      list) app_list;;
-      ssl) app_ssl "$@";;
-      *) usage;;
-    esac;;
-  config) sub="${1:-}"; shift || true
-    case "$sub" in
-      export) config_export "$@";;
-      import) config_import "$@";;
-      *) usage;;
-    esac;;
-  doctor) doctor;;
-  version) echo "mdv v$VERSION";;
-  help|"") usage;;
-  *) usage;;
+# 7. Scheduler (Cron)
+handle_cron() {
+    check_root
+    SUB=$2
+    case $SUB in
+        "add")
+            SCHEDULE=$3
+            COMMAND=$4
+            (crontab -l 2>/dev/null; echo "$SCHEDULE $COMMAND") | crontab -
+            echo "Cron job ditambahkan."
+            ;;
+        "list")
+            crontab -l 2>/dev/null || echo "Tidak ada cron job."
+            ;;
+        "rm")
+            crontab -l | grep -v "$3" | crontab -
+            echo "Cron job ID $3 dihapus."
+            ;;
+        *)
+            echo "Usage: mdv cron {add \"<schedule>\" \"<command>\"|list|rm <id>}"
+            ;;
+    esac
+}
+
+# 8. Timer (systemd)
+handle_timer() {
+    check_root
+    SUB=$2
+    case $SUB in
+        "add")
+            INTERVAL=$3
+            COMMAND=$4
+            NAME="mdv-timer-$(date +%s)"
+            cat > "/etc/systemd/system/$NAME.timer" << EOF
+[Unit]
+Description=$NAME
+
+[Timer]
+OnUnitActiveSec=$INTERVAL
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+            cat > "/etc/systemd/system/$NAME.service" << EOF
+[Unit]
+Description=$NAME
+
+[Service]
+Type=oneshot
+ExecStart=$COMMAND
+EOF
+            systemctl daemon-reload
+            systemctl enable "$NAME.timer"
+            systemctl start "$NAME.timer"
+            echo "Timer $NAME ditambahkan dengan interval $INTERVAL."
+            ;;
+        "list")
+            systemctl list-timers
+            ;;
+        "rm")
+            systemctl stop "$3.timer" "$3.service"
+            rm -f /etc/systemd/system/"$3".{timer,service}
+            systemctl daemon-reload
+            echo "Timer $3 dihapus."
+            ;;
+        *)
+            echo "Usage: mdv timer {add \"<interval>\" \"<command>\"|list|rm <name>}"
+            ;;
+    esac
+}
+
+# 9. Security
+handle_security() {
+    check_root
+    SUBCMD=$2
+    case $SUBCMD in
+        "ssh")
+            case $3 in
+                "port")
+                    sed -i "s/#*Port 22/Port $4/" /etc/ssh/sshd_config
+                    fw_cmd "add-port" "$4" "tcp"
+                    systemctl restart sshd
+                    echo "SSH port diganti ke $4."
+                    ;;
+                "disable-root")
+                    sed -i 's/#*PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
+                    systemctl restart sshd
+                    echo "Root login dinonaktifkan."
+                    ;;
+                "enable-root")
+                    sed -i 's/#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+                    systemctl restart sshd
+                    echo "Root login diaktifkan."
+                    ;;
+            esac
+            ;;
+        "fail2ban")
+            case $3 in
+                "install")
+                    pkg_install fail2ban
+                    systemctl enable --now fail2ban
+                    echo "Fail2ban diinstal dan diaktifkan."
+                    ;;
+            esac
+            ;;
+        "fw")
+            case $3 in
+                "allow")
+                    fw_cmd "add-rich-rule" "rule family=\"ipv4\" source address=\"$4\" accept"
+                    echo "IP $4 di-whitelist."
+                    ;;
+                "deny")
+                    fw_cmd "add-rich-rule" "rule family=\"ipv4\" source address=\"$4\" drop"
+                    echo "IP $4 di-blacklist."
+                    ;;
+                "list")
+                    fw_cmd "list-all"
+                    ;;
+            esac
+            ;;
+        *)
+            echo "Usage: mdv {ssh port <newport>|ssh disable-root|ssh enable-root|fail2ban install|fw allow <ip>|fw deny <ip>|fw list}"
+            ;;
+    esac
+}
+
+# 10. Database Management (MySQL/MariaDB)
+handle_db() {
+    check_root
+    if ! command -v mysql >/dev/null 2>&1; then
+        pkg_install mariadb-server  # Atau mysql-server
+        systemctl enable --now mariadb
+    fi
+    SUB=$2
+    case $SUB in
+        "create")
+            NAME=$3
+            USER=$4
+            PASS=$5
+            mysql -e "CREATE DATABASE IF NOT EXISTS \`$NAME\`; CREATE USER IF NOT EXISTS '$USER'@'localhost' IDENTIFIED BY '$PASS'; GRANT ALL ON \`$NAME\`.* TO '$USER'@'localhost'; FLUSH PRIVILEGES;"
+            echo "Database $NAME dibuat dengan user $USER."
+            ;;
+        "drop")
+            mysql -e "DROP DATABASE IF EXISTS \`$3\`;"
+            echo "Database $3 dihapus."
+            ;;
+        "list")
+            mysql -e "SHOW DATABASES;" 2>/dev/null || echo "Tidak ada akses MySQL."
+            ;;
+        *)
+            echo "Usage: mdv db {create <name> <user> <pass>|drop <name>|list}"
+            ;;
+    esac
+}
+
+# PostgreSQL
+handle_pg() {
+    check_root
+    if ! command -v psql >/dev/null 2>&1; then
+        pkg_install postgresql postgresql-contrib
+        systemctl enable --now postgresql
+    fi
+    SUB=$2
+    case $SUB in
+        "create")
+            NAME=$3
+            USER=$4
+            PASS=$5
+            sudo -u postgres psql -c "CREATE DATABASE \"$NAME\";"
+            sudo -u postgres psql -c "CREATE USER \"$USER\" WITH PASSWORD '$PASS';"
+            sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE \"$NAME\" TO \"$USER\";"
+            echo "PostgreSQL DB $NAME dibuat dengan user $USER."
+            ;;
+        "drop")
+            sudo -u postgres psql -c "DROP DATABASE IF EXISTS \"$3\";"
+            echo "PostgreSQL DB $3 dihapus."
+            ;;
+        "list")
+            sudo -u postgres psql -l | grep Name || echo "Tidak ada akses PostgreSQL."
+            ;;
+        *)
+            echo "Usage: mdv pg {create <name> <user> <pass>|drop <name>|list}"
+            ;;
+    esac
+}
+
+# 11. SSL Management
+handle_ssl() {
+    check_root
+    if ! command -v certbot >/dev/null 2>&1; then
+        pkg_install certbot
+    fi
+    SUB=$2
+    case $SUB in
+        "issue")
+            certbot certonly --standalone -d "$3" -n
+            echo "SSL diterbitkan untuk $3."
+            ;;
+        "renew")
+            certbot renew --cert-name "$3"
+            echo "SSL diperpanjang untuk $3."
+            ;;
+        "list")
+            certbot certificates
+            ;;
+        "revoke")
+            certbot revoke --cert-name "$3" -n
+            echo "SSL dicabut untuk $3."
+            ;;
+        *)
+            echo "Usage: mdv ssl {issue <domain>|renew <domain>|list|revoke <domain>}"
+            ;;
+    esac
+}
+
+# 12. Backup & Restore
+handle_backup() {
+    check_root
+    mkdir -p /backup
+    SUB=$2
+    case $SUB in
+        "app")
+            DOMAIN=$3
+            tar -czf "/backup/app-$DOMAIN-$(date +%Y%m%d).tar.gz" /etc/nginx/sites-available/"$DOMAIN" /etc/letsencrypt/live/"$DOMAIN" 2>/dev/null
+            echo "Backup app $DOMAIN selesai."
+            ;;
+        "db")
+            NAME=$3
+            mysqldump -u root -p"$NAME" > "/backup/db-$NAME-$(date +%Y%m%d).sql"  # Asumsi root pass kosong atau set env
+            echo "Backup DB $NAME selesai."
+            ;;
+        "all")
+            # Backup semua domain dan DB
+            for d in $(mdv app list); do mdv backup app "$d"; done
+            mysql -e "SHOW DATABASES;" | grep -v Database | while read db; do mdv backup db "$db"; done
+            echo "Backup semua selesai."
+            ;;
+        *)
+            echo "Usage: mdv backup {app <domain>|db <name>|all}"
+            ;;
+    esac
+}
+
+handle_restore() {
+    check_root
+    FILE=$2
+    if [[ $FILE == *.tar.gz ]]; then
+        tar -xzf "$FILE" -C /
+    elif [[ $FILE == *.sql ]]; then
+        mysql -u root < "$FILE"
+    fi
+    echo "Restore dari $FILE selesai."
+}
+
+# 13. User Management
+handle_user() {
+    check_root
+    SUB=$2
+    case $SUB in
+        "add")
+            useradd -m "$3"
+            echo "User $3 ditambahkan."
+            ;;
+        "rm")
+            userdel -r "$3"
+            echo "User $3 dihapus."
+            ;;
+        "list")
+            cut -d: -f1 /etc/passwd
+            ;;
+        "passwd")
+            passwd "$3"
+            ;;
+        *)
+            echo "Usage: mdv user {add <username>|rm <username>|list|passwd <username>}"
+            ;;
+    esac
+}
+
+# 14. System Info & Monitoring
+handle_sys() {
+    SUB=$2
+    case $SUB in
+        "info")
+            uname -a; uptime; curl -s ifconfig.me; cat /etc/os-release
+            ;;
+        "usage")
+            free -h; df -h; top -bn1 | head -20
+            ;;
+        "top")
+            if command -v htop >/dev/null 2>&1; then
+                htop
+            else
+                top
+            fi
+            ;;
+        *)
+            echo "Usage: mdv sys {info|usage|top}"
+            ;;
+    esac
+}
+
+handle_monitor() {
+    check_root
+    SUB=$2
+    case $SUB in
+        "enable")
+            WEBHOOK=$3
+            # Buat cron untuk check dan kirim ke Telegram (placeholder)
+            echo "* * * * * curl -X POST '$WEBHOOK' -d 'Server status: OK'" >> /etc/crontab
+            echo "Monitoring diaktifkan dengan webhook $WEBHOOK."
+            ;;
+        "cpu")
+            THRESHOLD=90  # Default
+            if [[ $3 == --threshold* ]]; then THRESHOLD=${3#*=}; fi
+            echo "Alert CPU > $THRESHOLD% diaktifkan (setup cron manual jika diperlukan)."
+            ;;
+        "disk")
+            THRESHOLD=80  # Default
+            if [[ $3 == --threshold* ]]; then THRESHOLD=${3#*=}; fi
+            echo "Alert Disk > $THRESHOLD% diaktifkan."
+            ;;
+        *)
+            echo "Usage: mdv monitor {enable <webhook>|cpu --threshold <val>|disk --threshold <val>}"
+            ;;
+    esac
+}
+
+# 15. Docker Management
+handle_docker() {
+    check_root
+    if ! command -v docker >/dev/null 2>&1; then
+        pkg_install docker.io docker-compose  # Untuk Debian; docker untuk RHEL
+        systemctl enable --now docker
+    fi
+    SUB=$2
+    case $SUB in
+        "up")
+            docker-compose -f "$3" up -d
+            ;;
+        "ps")
+            docker ps
+            ;;
+        "stop")
+            docker stop "$3"
+            ;;
+        "logs")
+            docker logs "$3"
+            ;;
+        *)
+            echo "Usage: mdv docker {up <compose.yml>|ps|stop <container>|logs <container>}"
+            ;;
+    esac
+}
+
+# 16. Config Management
+handle_config() {
+    SUB=$2
+    case $SUB in
+        "export")
+            load_config > "$3"
+            echo "Config diekspor ke $3."
+            ;;
+        "import")
+            cp "$3" "$CONFIG_FILE"
+            echo "Config diimpor dari $3."
+            ;;
+        "show")
+            load_config
+            ;;
+        "reset")
+            rm -f "$CONFIG_FILE"
+            echo "Semua konfigurasi mdv direset."
+            ;;
+        *)
+            echo "Usage: mdv config {export <file.json>|import <file.json>|show|reset}"
+            ;;
+    esac
+}
+
+# 17. Utility
+handle_utility() {
+    case $1 in
+        "doctor")
+            systemctl is-active --quiet nginx && echo "Nginx: OK" || echo "Nginx: Error"
+            systemctl is-active --quiet mariadb && echo "MariaDB: OK" || echo "MariaDB: Error"
+            fw_cmd "list-ports" > /dev/null && echo "Firewall: OK" || echo "Firewall: Error"
+            ;;
+        "version")
+            echo "mdv v1.1"
+            ;;
+        "help")
+            show_help
+            ;;
+        "update")
+            # Asumsi skrip dari Git; ganti dengan path repo
+            cd /opt/mdv && git pull origin main 2>/dev/null || echo "Update gagal; clone repo manual."
+            ;;
+        *)
+            show_help
+            ;;
+    esac
+}
+
+# 18. Pterodactyl Management
+handle_ptero() {
+    check_root
+    SUB=$2
+    case $SUB in
+        "install")
+            case $3 in
+                "panel")
+                    pkg_install nodejs npm composer php php-fpm php-mysql
+                    curl -L -o /tmp/panel.tar.gz https://github.com/pterodactyl/panel/releases/latest/download/panel.tar.gz
+                    tar -xzf /tmp/panel.tar.gz -C /var/www/
+                    cd /var/www/panel && composer install --no-dev --optimize-autoloader
+                    read -p "Masukkan domain: " DOMAIN
+                    read -p "Masukkan port: " PORT
+                    echo "Panel Pterodactyl diinstal di $DOMAIN:$PORT. Jalankan setup manual di browser."
+                    ;;
+                "wings")
+                    curl -L https://github.com/pterodactyl/wings/releases/latest/download/wings_linux_amd64 -o /usr/local/bin/wings
+                    chmod u+x /usr/local/bin/wings
+                    pkg_install supervisor
+                    echo "Wings Pterodactyl diinstal. Konfigurasi di /etc/supervisor/conf.d/wings.conf."
+                    ;;
+            esac
+            ;;
+        "status")
+            systemctl status pterodactyl-panel wings 2>/dev/null || echo "Service tidak ditemukan."
+            ;;
+        "restart")
+            systemctl restart "$4"
+            ;;
+        "logs")
+            journalctl -u "$4" -f 2>/dev/null || echo "Log tidak tersedia."
+            ;;
+        *)
+            echo "Usage: mdv ptero {install panel|install wings|status|restart <panel|wings>|logs <panel|wings>}"
+            ;;
+    esac
+}
+
+# 19. Mail Server
+handle_mail() {
+    check_root
+    SUB=$2
+    case $SUB in
+        "install")
+            pkg_install postfix dovecot-core
+            systemctl enable --now postfix dovecot
+            echo "Mail server (Postfix/Dovecot) diinstal."
+            ;;
+        "send")
+            TO=$3
+            SUBJECT=$4
+            echo "Test body" | mail -s "$SUBJECT" "$TO"
+            echo "Email test dikirim ke $TO."
+            ;;
+        "status")
+            systemctl status postfix dovecot
+            ;;
+        "log")
+            journalctl -u postfix -f
+            ;;
+        *)
+            echo "Usage: mdv mail {install|send <to> <subject>|status|log}"
+            ;;
+    esac
+}
+
+# 20. Load Balancer
+handle_lb() {
+    check_root
+    SUB=$2
+    case $SUB in
+        "add")
+            DOMAIN=$3
+            shift 3
+            PORTS="$*"
+            # Tambah upstream ke nginx.conf
+            cat >> /etc/nginx/nginx.conf << EOF
+
+upstream backend_$DOMAIN {
+$(for p in $PORTS; do echo "    server 127.0.0.1:$p;"; done)
+}
+
+server {
+    listen 80;
+    server_name $DOMAIN;
+    location / {
+        proxy_pass http://backend_$DOMAIN;
+    }
+}
+EOF
+            nginx -t && systemctl reload nginx
+            echo "Load balancer untuk $DOMAIN dengan ports $PORTS dibuat."
+            ;;
+        "rm")
+            sed -i "/upstream backend_$3/,/server {/,/}/d" /etc/nginx/nginx.conf
+            nginx -t && systemctl reload nginx
+            echo "Load balancer $3 dihapus."
+            ;;
+        "list")
+            grep -A10 "upstream" /etc/nginx/nginx.conf
+            ;;
+        *)
+            echo "Usage: mdv lb {add <domain> <port1> <port2>...|rm <domain>|list}"
+            ;;
+    esac
+}
+
+# 21. File Management
+handle_file() {
+    SUB=$2
+    case $SUB in
+        "upload")
+            scp "$3" root@localhost:"$4"  # Asumsi lokal; gunakan rsync untuk remote
+            echo "File $3 diupload ke $4."
+            ;;
+        "download")
+            scp root@localhost:"$3" "$4"
+            echo "File $3 didownload ke $4."
+            ;;
+        "list")
+            ls -la "$3"
+            ;;
+        *)
+            echo "Usage: mdv file {upload <local> <remote>|download <remote> <local>|list <dir>}"
+            ;;
+    esac
+}
+
+# 22. Cache / Redis
+handle_redis() {
+    check_root
+    SUB=$2
+    case $SUB in
+        "install")
+            pkg_install redis-server
+            systemctl enable --now redis-server
+            echo "Redis diinstal."
+            ;;
+        "flushall")
+            redis-cli FLUSHALL
+            ;;
+        "cli")
+            redis-cli
+            ;;
+        *)
+            echo "Usage: mdv redis {install|flushall|cli}"
+            ;;
+    esac
+}
+
+# 23. Kubernetes / K3s
+handle_k3s() {
+    check_root
+    SUB=$2
+    case $SUB in
+        "install")
+            curl -sfL https://get.k3s.io | sh -
+            echo "K3s diinstal."
+            ;;
+        "status")
+            systemctl status k3s
+            ;;
+        "node")
+            case $3 in
+                "list")
+                    kubectl get nodes
+                    ;;
+            esac
+            ;;
+        *)
+            echo "Usage: mdv k3s {install|status|node list}"
+            ;;
+    esac
+}
+
+# 24. AI/ML Helper
+handle_ai() {
+    check_root
+    if ! command -v python3 >/dev/null 2>&1; then
+        pkg_install python3 python3-pip
+    fi
+    SUB=$2
+    case $SUB in
+        "install")
+            case $3 in
+                "pytorch")
+                    python3 -m pip install torch torchvision
+                    ;;
+                "tensorflow")
+                    python3 -m pip install tensorflow
+                    ;;
+            esac
+            echo "$3 diinstal."
+            ;;
+        "jupyter")
+            case $3 in
+                "enable")
+                    python3 -m pip install jupyter
+                    jupyter notebook --generate-config
+                    echo "Jupyter diaktifkan. Jalankan 'jupyter notebook' untuk start."
+                    ;;
+            esac
+            ;;
+        *)
+            echo "Usage: mdv ai {install pytorch|install tensorflow|jupyter enable}"
+            ;;
+    esac
+}
+
+# 25. Deployment Shortcuts
+handle_deploy() {
+    check_root
+    TYPE=$2
+    DOMAIN=$3
+    DIR=$4
+    case $TYPE in
+        "laravel")
+            pkg_install composer php php-fpm php-mysql
+            cd "$DIR" && composer install --no-dev --optimize-autoloader
+            mdv app add "$DOMAIN" 8000
+            mdv domain add "$DOMAIN" $(curl -s ifconfig.me)
+            echo "Laravel di-deploy ke $DOMAIN di $DIR."
+            ;;
+        "node")
+            pkg_install nodejs npm
+            cd "$DIR" && npm install
+            mdv app add "$DOMAIN" 3000
+            mdv node start "$DIR" "$DOMAIN"
+            echo "Node.js di-deploy ke $DOMAIN di $DIR."
+            ;;
+        "go")
+            pkg_install golang
+            cd "$DIR" && go mod tidy && go build -o app
+            mdv app add "$DOMAIN" 8080
+            mdv go start "$DIR/app" "$DOMAIN" 8080
+            echo "Go di-deploy ke $DOMAIN di $DIR."
+            ;;
+        *)
+            echo "Usage: mdv deploy {laravel|node|go} <domain> <dir>"
+            ;;
+    esac
+}
+
+# 26. Stack Installer
+handle_stack() {
+    check_root
+    SUB=$2
+    case $SUB in
+        "lamp")
+            pkg_install apache2 mariadb-server php libapache2-mod-php php-mysql
+            systemctl enable --now apache2 mariadb
+            echo "LAMP stack diinstal."
+            ;;
+        "lemp")
+            pkg_install nginx mariadb-server php-fpm php-mysql
+            systemctl enable --now nginx mariadb
+            echo "LEMP stack diinstal."
+            ;;
+        "mean")
+            pkg_install mongodb nodejs npm
+            npm install -g @angular/cli express-generator
+            systemctl enable --now mongod
+            echo "MEAN stack diinstal."
+            ;;
+        "mevn")
+            pkg_install mongodb nodejs npm
+            npm install -g @vue/cli express-generator
+            systemctl enable --now mongod
+            echo "MEVN stack diinstal."
+            ;;
+        *)
+            echo "Usage: mdv stack {lamp|lemp|mean|mevn}"
+            ;;
+    esac
+}
+
+# Main dispatcher
+detect_os
+CATEGORY=$1
+case $CATEGORY in
+    "port") handle_port "$@";;
+    "domain") handle_domain "$@";;
+    "app") handle_app "$@";;
+    "pma") handle_pma "$@";;
+    "node") handle_node "$@";;
+    "go") handle_go "$@";;
+    "cron") handle_cron "$@";;
+    "timer") handle_timer "$@";;
+    "ssh"|"fail2ban"|"fw") handle_security "$@";;
+    "db") handle_db "$@";;
+    "pg") handle_pg "$@";;
+    "ssl") handle_ssl "$@";;
+    "backup") handle_backup "$@";;
+    "restore") handle_restore "$@";;
+    "user") handle_user "$@";;
+    "sys") handle_sys "$@";;
+    "monitor") handle_monitor "$@";;
+    "docker") handle_docker "$@";;
+    "config") handle_config "$@";;
+    "doctor"|"version"|"help"|"update") handle_utility "$@";;
+    "ptero") handle_ptero "$@";;
+    "mail") handle_mail "$@";;
+    "lb") handle_lb "$@";;
+    "file") handle_file "$@";;
+    "redis") handle_redis "$@";;
+    "k3s") handle_k3s "$@";;
+    "ai") handle_ai "$@";;
+    "deploy") handle_deploy "$@";;
+    "stack") handle_stack "$@";;
+    *) show_help;;
 esac
