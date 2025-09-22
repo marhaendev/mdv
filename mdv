@@ -368,7 +368,7 @@ handle_port() {
             if [ "$3" = "on" ]; then
                 fw_cmd "list-ports"
             elif [ "$3" = "off" ]; then
-                ss -tuln | awk '{print $5}' | cut -d: -f2 | sort -u | while read p; do
+                ss -tuln | awk '{print $5}' | cut -d: -f2 | sort -u | grep -E '^[0-9]+$' | while read p; do  # Filter hanya numerik
                     QUERY_TCP=$(fw_cmd "query-port" "$p" "tcp")
                     QUERY_UDP=$(fw_cmd "query-port" "$p" "udp")
                     if [ "$QUERY_TCP" != "yes" ] && [ "$QUERY_UDP" != "yes" ]; then
@@ -376,20 +376,30 @@ handle_port() {
                     fi
                 done
             else
-                ss -tuln | awk '{print $5}' | cut -d: -f2 | sort -u
+                ss -tuln | awk '{print $5}' | cut -d: -f2 | sort -u | grep -E '^[0-9]+$ || echo "No listening ports found."
                 echo "--- Allowed Ports ---"
                 fw_cmd "list-ports"
             fi
             ;;
         "e")
-            PROTO=${3:-tcp}
-            fw_cmd "add-port" "$2" "$PROTO"
-            echo "Port $2/$PROTO dibuka."
+            PORT=$3
+            PROTO=${4:-tcp}
+            if ! is_valid_port "$PORT"; then
+                echo "Error: Invalid port number: $PORT"
+                exit 1
+            fi
+            fw_cmd "add-port" "$PORT" "$PROTO"
+            echo "Port $PORT/$PROTO dibuka."
             ;;
         "d")
-            PROTO=${3:-tcp}
-            fw_cmd "remove-port" "$2" "$PROTO"
-            echo "Port $2/$PROTO ditutup."
+            PORT=$3
+            PROTO=${4:-tcp}
+            if ! is_valid_port "$PORT"; then
+                echo "Error: Invalid port number: $PORT"
+                exit 1
+            fi
+            fw_cmd "remove-port" "$PORT" "$PROTO"
+            echo "Port $PORT/$PROTO ditutup."
             ;;
         "reset")
             fw_cmd "panic-off"
