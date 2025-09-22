@@ -1,6 +1,6 @@
 #!/bin/bash
 # mdv - VPS Management Tool (14 Fitur Utama)
-# Versi: 1.14.4 (Fixed Remi URL, CRB enable, PHP module install/enable, package names for AlmaLinux 9)
+# Versi: 1.14.5 (Fixed IPv6 URL formatting, added w3m installation)
 # Kompatibel: AlmaLinux/RHEL/Fedora (dnf/yum, firewalld), Debian/Ubuntu (apt, ufw fallback)
 # Deteksi Distribusi
 detect_os() {
@@ -44,6 +44,15 @@ setup_php_repos() {
             dnf module enable php:remi-8.3 -y || dnf module install php:remi-8.3 -y || true
             ;;
     esac
+}
+# Fungsi helper: Get formatted external IP URL
+get_pma_url() {
+    IP=$(curl -s ifconfig.me)
+    if [[ $IP =~ : ]]; then
+        echo "http://[$IP]/pma"
+    else
+        echo "http://$IP/pma"
+    fi
 }
 # Fungsi helper: Firewall (firewalld prioritas, fallback ufw)
 fw_cmd() {
@@ -202,7 +211,7 @@ handle_init() {
     detect_os
     setup_php_repos
     # Paket dasar
-    CORE_PKGS="jq htop curl wget git"
+    CORE_PKGS="jq htop curl wget git w3m"
     pkg_install $CORE_PKGS
     # Nginx & Certbot
     pkg_install nginx
@@ -304,7 +313,7 @@ handle_utility() {
             echo "=== End Status ==="
             ;;
         "version")
-            echo "mdv v1.14.4 (14 Fitur)"
+            echo "mdv v1.14.5 (14 Fitur)"
             ;;
         "help")
             show_help
@@ -457,6 +466,7 @@ EOF
 handle_pma() {
     check_root
     SUB=$2
+    PMA_URL=$(get_pma_url)
     case $SUB in
         "add")
             setup_php_repos
@@ -485,16 +495,15 @@ handle_pma() {
             ln -sf /usr/share/phpMyAdmin /var/www/html/pma
             fw_cmd "add-port" "80" "tcp"
             systemctl restart php-fpm nginx || true
-            echo "phpMyAdmin diinisialisasi. Akses di http://$(curl -s ifconfig.me)/pma"
+            echo "phpMyAdmin diinisialisasi. Akses di $PMA_URL"
             ;;
         "o")
-            IP=$(curl -s ifconfig.me)
-            echo "phpMyAdmin siap. Buka di browser: http://$IP/pma"
+            echo "phpMyAdmin siap. Buka di browser: $PMA_URL"
             # Jika w3m terinstal, open langsung (opsional)
             if command -v w3m >/dev/null 2>&1; then
-                w3m http://$IP/pma
+                w3m "$PMA_URL"
             else
-                echo "Instal w3m untuk open langsung."
+                echo "Instal w3m untuk open langsung: dnf install w3m"
             fi
             ;;
         *)
