@@ -1,9 +1,7 @@
 #!/bin/bash
-
 # mdv - VPS Management Tool (14 Fitur Utama)
-# Versi: 1.14.2 (Added tw, pma init/o, Expanded doctor)
+# Versi: 1.14.3 (Fixed package names, repos, services, doctor checks)
 # Kompatibel: AlmaLinux/RHEL/Fedora (dnf/yum, firewalld), Debian/Ubuntu (apt, ufw fallback)
-
 # Deteksi Distribusi
 detect_os() {
     if [ -f /etc/os-release ]; then
@@ -15,7 +13,6 @@ detect_os() {
         exit 1
     fi
 }
-
 # Fungsi helper: Package Manager
 pkg_install() {
     detect_os
@@ -36,7 +33,17 @@ pkg_install() {
             ;;
     esac
 }
-
+# Fungsi helper: Setup repos for PHP/Remi (RHEL-like)
+setup_php_repos() {
+    case $OS in
+        "almalinux"|"rhel"|"centos"|"fedora")
+            pkg_install epel-release
+            dnf install -y "https://rpms.remirepo.net/enterprise/remi-release-${VER}.rpm" || true
+            dnf module reset php -y || true
+            dnf module enable php:remi-8.3 -y || true
+            ;;
+    esac
+}
 # Fungsi helper: Firewall (firewalld prioritas, fallback ufw)
 fw_cmd() {
     if command -v firewall-cmd >/dev/null 2>&1; then
@@ -64,12 +71,10 @@ fw_cmd() {
         exit 1
     fi
 }
-
 # Direktori konfigurasi
 CONFIG_DIR="$HOME/.mdv"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 mkdir -p "$CONFIG_DIR"
-
 # Fungsi helper: Load config JSON
 load_config() {
     if command -v jq >/dev/null 2>&1; then
@@ -78,12 +83,10 @@ load_config() {
         echo "{}"
     fi
 }
-
 # Fungsi helper: Save config
 save_config() {
     echo "$1" > "$CONFIG_FILE"
 }
-
 # Fungsi helper: Cek root
 check_root() {
     if [ "$EUID" -ne 0 ]; then
@@ -91,150 +94,156 @@ check_root() {
         exit 1
     fi
 }
-
 # Fungsi helper: Validasi port (hanya angka positif)
 is_valid_port() {
     [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
 }
-
 # Fungsi utama: Help (Diperbarui dengan fitur baru)
 show_help() {
     cat << EOF
 mdv - VPS Management Tool (14 Fitur Utama)
-
 Penggunaan: mdv <category> <subcommand> [args]
-
 1. Port Management (firewalld)
-   mdv port list          # Semua port (allowed + listening-not-allowed)
-   mdv port list on       # Port yang dibuka di firewall
-   mdv port list off      # Port listen tapi belum dibuka
-   mdv port e <port> [tcp|udp]  # Buka port (default tcp)
-   mdv port d <port> [tcp|udp]  # Tutup port
-   mdv port reset         # Reset firewall ke default
-
+   mdv port list # Semua port (allowed + listening-not-allowed)
+   mdv port list on # Port yang dibuka di firewall
+   mdv port list off # Port listen tapi belum dibuka
+   mdv port e <port> [tcp|udp] # Buka port (default tcp)
+   mdv port d <port> [tcp|udp] # Tutup port
+   mdv port reset # Reset firewall ke default
 2. Domain Management (/etc/hosts)
-   mdv domain add <domain> <ip>  # Arahkan domain ke IP (lokal VPS)
-   mdv domain rm <domain>        # Hapus mapping
-   mdv domain list               # Daftar domain
-   mdv domain check <domain>     # Cek resolve ke IP VPS
-
+   mdv domain add <domain> <ip> # Arahkan domain ke IP (lokal VPS)
+   mdv domain rm <domain> # Hapus mapping
+   mdv domain list # Daftar domain
+   mdv domain check <domain> # Cek resolve ke IP VPS
 3. App Management (Nginx reverse proxy)
-   mdv app add <domain> <port>   # Buat config nginx: domain → 127.0.0.1:<port>
-   mdv app rm <domain>           # Hapus config
-   mdv app list                  # Daftar config
-   mdv app ssl <domain>          # Pasang Let's Encrypt SSL
-   mdv app unssl <domain>        # Hapus SSL
-   mdv app info <domain>         # Detail config
-
+   mdv app add <domain> <port> # Buat config nginx: domain → 127.0.0.1:<port>
+   mdv app rm <domain> # Hapus config
+   mdv app list # Daftar config
+   mdv app ssl <domain> # Pasang Let's Encrypt SSL
+   mdv app unssl <domain> # Hapus SSL
+   mdv app info <domain> # Detail config
 4. phpMyAdmin Management
-   mdv pma add <domain>          # Install & setup phpMyAdmin
-   mdv pma rm <domain>           # Hapus config
-   mdv pma list                  # Daftar domain
-   mdv pma i | init              # Inisialisasi phpMyAdmin
-   mdv pma o                     # Open phpMyAdmin di browser
-
+   mdv pma add <domain> # Install & setup phpMyAdmin
+   mdv pma rm <domain> # Hapus config
+   mdv pma list # Daftar domain
+   mdv pma i | init # Inisialisasi phpMyAdmin
+   mdv pma o # Open phpMyAdmin di browser
 5. Node.js App Runner (pm2)
-   mdv node start <dir> <name>   # Jalankan via pm2
-   mdv node stop <name>          # Stop
-   mdv node restart <name>       # Restart
-   mdv node list                 # List app
-   mdv node logs <name>          # Lihat log
-
+   mdv node start <dir> <name> # Jalankan via pm2
+   mdv node stop <name> # Stop
+   mdv node restart <name> # Restart
+   mdv node list # List app
+   mdv node logs <name> # Lihat log
 6. Golang App Runner (systemd)
-   mdv go start <binary> <name> <port>  # Jalankan binary
-   mdv go stop <name>                  # Stop
-   mdv go restart <name>               # Restart
-   mdv go list                         # List app
-   mdv go logs <name>                  # Lihat log
-
+   mdv go start <binary> <name> <port> # Jalankan binary
+   mdv go stop <name> # Stop
+   mdv go restart <name> # Restart
+   mdv go list # List app
+   mdv go logs <name> # Lihat log
 7. Scheduler (Cron helper)
-   mdv cron add "<schedule>" "<command>"  # Tambah job (e.g., "* * * * *")
-   mdv cron list                          # List job
-   mdv cron rm <id>                       # Hapus job
-
+   mdv cron add "<schedule>" "<command>" # Tambah job (e.g., "* * * * *")
+   mdv cron list # List job
+   mdv cron rm <id> # Hapus job
 8. Timer (systemd)
-   mdv timer add "<interval>" "<command>"  # e.g., "10s"
-   mdv timer list                         # List job
-   mdv timer rm <name>                    # Hapus job
-
+   mdv timer add "<interval>" "<command>" # e.g., "10s"
+   mdv timer list # List job
+   mdv timer rm <name> # Hapus job
 9. Security
-   mdv ssh port <newport>         # Ganti SSH port
-   mdv ssh disable-root           # Disable root login
-   mdv ssh enable-root            # Enable root login
-   mdv fail2ban install           # Setup fail2ban
-   mdv fw allow <ip>              # Whitelist IP
-   mdv fw deny <ip>               # Blacklist IP
-   mdv fw list                    # List aturan
-
+   mdv ssh port <newport> # Ganti SSH port
+   mdv ssh disable-root # Disable root login
+   mdv ssh enable-root # Enable root login
+   mdv fail2ban install # Setup fail2ban
+   mdv fw allow <ip> # Whitelist IP
+   mdv fw deny <ip> # Blacklist IP
+   mdv fw list # List aturan
 10. Database Management
-    mdv db create <name> <user> <pass>  # MySQL/MariaDB
-    mdv db drop <name>                  # Hapus DB
-    mdv db list                         # Daftar DB
-    mdv pg create <name> <user> <pass>  # PostgreSQL
-    mdv pg drop <name>                  # Hapus DB
-    mdv pg list                         # Daftar DB
-
+    mdv db create <name> <user> <pass> # MySQL/MariaDB
+    mdv db drop <name> # Hapus DB
+    mdv db list # Daftar DB
+    mdv pg create <name> <user> <pass> # PostgreSQL
+    mdv pg drop <name> # Hapus DB
+    mdv pg list # Daftar DB
 11. SSL Management
-    mdv ssl issue <domain>     # Pasang Let's Encrypt
-    mdv ssl renew <domain>     # Perpanjang
-    mdv ssl list               # Daftar cert
-    mdv ssl revoke <domain>    # Hapus cert
-
+    mdv ssl issue <domain> # Pasang Let's Encrypt
+    mdv ssl renew <domain> # Perpanjang
+    mdv ssl list # Daftar cert
+    mdv ssl revoke <domain> # Hapus cert
 12. Backup & Restore
-    mdv backup app <domain>    # Backup nginx + SSL
-    mdv backup db <name>       # Backup DB
-    mdv backup all             # Backup semua
-    mdv restore <file>         # Restore dari file
-
+    mdv backup app <domain> # Backup nginx + SSL
+    mdv backup db <name> # Backup DB
+    mdv backup all # Backup semua
+    mdv restore <file> # Restore dari file
 13. User Management
-    mdv user add <username>    # Tambah user
-    mdv user rm <username>     # Hapus user
-    mdv user list              # Daftar user
+    mdv user add <username> # Tambah user
+    mdv user rm <username> # Hapus user
+    mdv user list # Daftar user
     mdv user passwd <username> # Ubah password
-
 14. System Info & Monitoring
-    mdv sys info               # Detail VPS
-    mdv sys usage              # Usage CPU/RAM/Disk
-    mdv sys top                # Proses (mirip htop)
-    mdv monitor enable <webhook>  # Aktifkan notif Telegram
-    mdv monitor cpu --threshold 90  # Alert CPU
+    mdv sys info # Detail VPS
+    mdv sys usage # Usage CPU/RAM/Disk
+    mdv sys top # Proses (mirip htop)
+    mdv monitor enable <webhook> # Aktifkan notif Telegram
+    mdv monitor cpu --threshold 90 # Alert CPU
     mdv monitor disk --threshold 80 # Alert Disk
-
 Utility:
-   mdv tw                      # CD ke /var/www/
-   mdv init | i                # Inisialisasi dependensi
-   mdv doctor                  # Cek status 14 fitur
-   mdv version                 # Versi
-   mdv help                    # Bantuan ini
-
+   mdv tw # CD ke /var/www/
+   mdv init | i # Inisialisasi dependensi
+   mdv doctor # Cek status 14 fitur
+   mdv version # Versi
+   mdv help # Bantuan ini
 EOF
     exit 0
 }
-
 # Init/Install Dependencies (Sesuaikan untuk 14 fitur)
 handle_init() {
     check_root
     echo "Memulai inisialisasi mdv: Menginstal dependensi untuk 14 fitur..."
     detect_os
-
+    case $OS in
+        "almalinux"|"rhel"|"centos"|"fedora")
+            dnf install -y epel-release
+            dnf install -y "https://rpms.remirepo.net/enterprise/remi-release-${VER}.rpm" || true
+            dnf module reset php -y || true
+            dnf module enable php:remi-8.3 -y || true
+            ;;
+    esac
     # Paket dasar
     CORE_PKGS="jq htop curl wget git"
     pkg_install $CORE_PKGS
-
     # Nginx & Certbot
     pkg_install nginx
     systemctl enable --now nginx
     pkg_install certbot python3-certbot-nginx
-
+    # Default Nginx config for static files
+    mkdir -p /var/www/html /etc/nginx/sites-{available,enabled}
+    cat > /etc/nginx/sites-available/default << EOF
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    root /var/www/html;
+    index index.php index.html index.htm;
+    server_name _;
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+    location ~ \.php\$ {
+        include fastcgi_params;
+        fastcgi_pass unix:/run/php-fpm/www.sock;
+        fastcgi_index index.php;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+    }
+}
+EOF
+    ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/
+    rm -f /etc/nginx/sites-enabled/default.bak 2>/dev/null || true
+    nginx -t && systemctl reload nginx || true
     # MariaDB
     pkg_install mariadb-server
     systemctl enable --now mariadb
-    mysql_secure_installation  # Interaktif
-
+    mysql_secure_installation # Interaktif
     # PostgreSQL
     pkg_install postgresql postgresql-contrib
     systemctl enable --now postgresql
-
     # Firewall
     case $OS in
         "almalinux"|"rhel"|"centos"|"fedora")
@@ -249,27 +258,30 @@ handle_init() {
             ufw default allow outgoing
             ;;
     esac
-
     # Node.js & PM2
     pkg_install nodejs npm
     npm install -g pm2
-
     # Golang
     pkg_install golang
-
     # Fail2ban
     pkg_install fail2ban
     systemctl enable --now fail2ban
-
     # PHP & phpMyAdmin
-    pkg_install php php-fpm php-mysql php-mysqli phpmyadmin composer
-
+    pkg_install php php-fpm php-mysql php-mysqli phpMyAdmin composer
+    systemctl enable --now php-fpm
     # Buat direktori www jika belum ada
     mkdir -p /var/www
-
+    # Cron service
+    case $OS in
+        "almalinux"|"rhel"|"centos"|"fedora")
+            systemctl enable --now crond
+            ;;
+        "ubuntu"|"debian")
+            systemctl enable --now cron
+            ;;
+    esac
     echo "Inisialisasi selesai. Jalankan 'mdv doctor' untuk verifikasi."
 }
-
 # Utility (Diperluas: Doctor cek 14 fitur, tambah tw)
 handle_utility() {
     case $1 in
@@ -284,21 +296,21 @@ handle_utility() {
             command -v htop >/dev/null && echo "htop: OK" || echo "htop: Error"
             systemctl is-active --quiet nginx && echo "Nginx (App Mgmt): OK" || echo "Nginx (App Mgmt): Error"
             systemctl is-active --quiet mariadb && echo "MariaDB (DB Mgmt): OK" || echo "MariaDB (DB Mgmt): Error"
-            command -v psql >/dev/null && echo "PostgreSQL (DB Mgmt): OK" || echo "PostgreSQL (DB Mgmt): Error"
+            systemctl is-active --quiet postgresql && echo "PostgreSQL (DB Mgmt): OK" || echo "PostgreSQL (DB Mgmt): Error"
             fw_cmd "list-ports" > /dev/null 2>&1 && echo "Firewall (Port/Security): OK" || echo "Firewall (Port/Security): Error"
             command -v node >/dev/null && echo "Node.js (Node Runner): OK" || echo "Node.js (Node Runner): Error"
             command -v pm2 >/dev/null && echo "PM2 (Node Runner): OK" || echo "PM2 (Node Runner): Error"
             command -v go >/dev/null && echo "Golang (Go Runner): OK" || echo "Golang (Go Runner): Error"
-            crontab -l >/dev/null 2>&1 && echo "Cron (Scheduler): OK" || echo "Cron (Scheduler): Error"
+            systemctl is-active --quiet crond 2>/dev/null || systemctl is-active --quiet cron 2>/dev/null && echo "Cron (Scheduler): OK" || echo "Cron (Scheduler): Error"
             systemctl list-timers >/dev/null 2>&1 && echo "Systemd Timer: OK" || echo "Systemd Timer: Error"
             systemctl is-active --quiet fail2ban && echo "Fail2ban (Security): OK" || echo "Fail2ban (Security): Error"
-            command -v php >/dev/null && echo "PHP (pma): OK" || echo "PHP (pma): Error"
+            systemctl is-active --quiet php-fpm && echo "PHP (pma): OK" || echo "PHP (pma): Error"
             command -v certbot >/dev/null && echo "Certbot (SSL): OK" || echo "Certbot (SSL): Error"
             [ -d /var/www ] && echo "WWW Dir (tw): OK" || echo "WWW Dir (tw): Error"
             echo "=== End Status ==="
             ;;
         "version")
-            echo "mdv v1.1 (14 Fitur)"
+            echo "mdv v1.14.3 (14 Fitur)"
             ;;
         "help")
             show_help
@@ -308,7 +320,6 @@ handle_utility() {
             ;;
     esac
 }
-
 # 1. Port Management
 handle_port() {
     SUB=$2
@@ -359,7 +370,6 @@ handle_port() {
             ;;
     esac
 }
-
 # 2. Domain Management
 handle_domain() {
     check_root
@@ -396,7 +406,6 @@ handle_domain() {
             ;;
     esac
 }
-
 # 3. App Management (Nginx)
 handle_app() {
     check_root
@@ -450,19 +459,24 @@ EOF
             ;;
     esac
 }
-
 # 4. phpMyAdmin Management (Diperbarui dengan init dan open)
 handle_pma() {
     check_root
     SUB=$2
     case $SUB in
         "add")
-            pkg_install phpmyadmin php-mysqli
-            ln -s /usr/share/phpmyadmin /var/www/html/pma
+            setup_php_repos
+            pkg_install phpMyAdmin php-mysqli
+            mkdir -p /var/www/html
+            ln -s /usr/share/phpMyAdmin /var/www/html/pma
+            systemctl restart php-fpm nginx || true
             echo "phpMyAdmin diinstal dan setup untuk $3."
             ;;
         "rm")
-            apt purge phpmyadmin 2>/dev/null || yum remove phpmyadmin 2>/dev/null || dnf remove phpmyadmin 2>/dev/null
+            case $OS in
+                "ubuntu"|"debian") apt purge phpmyadmin 2>/dev/null ;;
+                *) dnf remove -y phpMyAdmin 2>/dev/null || yum remove -y phpMyAdmin 2>/dev/null ;;
+            esac
             rm -rf /var/www/html/pma
             echo "phpMyAdmin dihapus untuk $3."
             ;;
@@ -470,10 +484,13 @@ handle_pma() {
             ls /var/www/html/ 2>/dev/null | grep pma || echo "Tidak ada phpMyAdmin."
             ;;
         "init"|"i")
-            pkg_install phpmyadmin php-mysqli
+            setup_php_repos
+            pkg_install php php-fpm php-mysql php-mysqli phpMyAdmin
+            systemctl enable --now php-fpm
             mkdir -p /var/www/html
-            ln -s /usr/share/phpmyadmin /var/www/html/pma
+            ln -s /usr/share/phpMyAdmin /var/www/html/pma
             fw_cmd "add-port" "80" "tcp"
+            systemctl restart php-fpm nginx || true
             echo "phpMyAdmin diinisialisasi. Akses di http://$(curl -s ifconfig.me)/pma"
             ;;
         "o")
@@ -483,7 +500,7 @@ handle_pma() {
             if command -v w3m >/dev/null 2>&1; then
                 w3m http://$IP/pma
             else
-                echo "Instal w3m untuk open langsung: pkg_install w3m"
+                echo "Instal w3m untuk open langsung."
             fi
             ;;
         *)
@@ -491,7 +508,6 @@ handle_pma() {
             ;;
     esac
 }
-
 # 5. Node.js App Runner (pm2)
 handle_node() {
     check_root
@@ -525,7 +541,6 @@ handle_node() {
             ;;
     esac
 }
-
 # 6. Golang App Runner (systemd)
 handle_go() {
     check_root
@@ -539,13 +554,11 @@ handle_go() {
             cat > "$SERVICE_FILE" << EOF
 [Unit]
 Description=Go App $NAME
-
 [Service]
 ExecStart=$BINARY
 WorkingDirectory=/var/www
 Restart=always
 Environment=PORT=$PORT
-
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -571,7 +584,6 @@ EOF
             ;;
     esac
 }
-
 # 7. Scheduler (Cron)
 handle_cron() {
     check_root
@@ -595,7 +607,6 @@ handle_cron() {
             ;;
     esac
 }
-
 # 8. Timer (systemd)
 handle_timer() {
     check_root
@@ -608,18 +619,15 @@ handle_timer() {
             cat > "/etc/systemd/system/$NAME.timer" << EOF
 [Unit]
 Description=$NAME
-
 [Timer]
 OnUnitActiveSec=$INTERVAL
 Persistent=true
-
 [Install]
 WantedBy=timers.target
 EOF
             cat > "/etc/systemd/system/$NAME.service" << EOF
 [Unit]
 Description=$NAME
-
 [Service]
 Type=oneshot
 ExecStart=$COMMAND
@@ -643,7 +651,6 @@ EOF
             ;;
     esac
 }
-
 # 9. Security
 handle_security() {
     check_root
@@ -698,7 +705,6 @@ handle_security() {
             ;;
     esac
 }
-
 # 10. Database Management
 handle_db() {
     check_root
@@ -727,7 +733,6 @@ handle_db() {
             ;;
     esac
 }
-
 handle_pg() {
     check_root
     if ! command -v psql >/dev/null 2>&1; then
@@ -757,7 +762,6 @@ handle_pg() {
             ;;
     esac
 }
-
 # 11. SSL Management
 handle_ssl() {
     check_root
@@ -786,7 +790,6 @@ handle_ssl() {
             ;;
     esac
 }
-
 # 12. Backup & Restore
 handle_backup() {
     check_root
@@ -813,7 +816,6 @@ handle_backup() {
             ;;
     esac
 }
-
 handle_restore() {
     check_root
     FILE=$2
@@ -824,7 +826,6 @@ handle_restore() {
     fi
     echo "Restore dari $FILE selesai."
 }
-
 # 13. User Management
 handle_user() {
     check_root
@@ -849,7 +850,6 @@ handle_user() {
             ;;
     esac
 }
-
 # 14. System Info & Monitoring
 handle_sys() {
     SUB=$2
@@ -872,7 +872,6 @@ handle_sys() {
             ;;
     esac
 }
-
 handle_monitor() {
     check_root
     SUB=$2
@@ -897,7 +896,6 @@ handle_monitor() {
             ;;
     esac
 }
-
 # Main dispatcher
 detect_os
 CATEGORY=$1
